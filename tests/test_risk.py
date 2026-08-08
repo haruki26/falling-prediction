@@ -1,0 +1,41 @@
+import numpy as np
+
+from falling_prediction.risk import RiskEvaluator, RiskLevel
+
+
+def pose(x=0.5, y=0.5):
+    points = np.zeros((17, 3), dtype=float)
+    points[:, :2] = (x, y)
+    points[:, 2] = 1.0
+    return points
+
+
+def test_centered_pose_is_safe():
+    result = RiskEvaluator().evaluate(pose())
+    assert result.level is RiskLevel.SAFE
+    assert result.reasons == ()
+
+
+def test_body_outside_bed_is_danger():
+    points = pose()
+    points[15, :2] = (0.95, 0.5)
+    result = RiskEvaluator().evaluate(points)
+    assert result.level is RiskLevel.DANGER
+    assert "outside bed" in result.reasons[0]
+
+
+def test_edge_and_raised_upper_body_is_danger():
+    points = pose(0.82, 0.5)
+    points[[5, 6], 1] = 0.30
+    points[[11, 12], 1] = 0.55
+    result = RiskEvaluator().evaluate(points)
+    assert result.level is RiskLevel.DANGER
+
+
+def test_movement_toward_edge_is_temporal_signal():
+    evaluator = RiskEvaluator()
+    evaluator.evaluate(pose(0.50))
+    result = evaluator.evaluate(pose(0.78))
+    assert result.score == 2
+    assert result.level is RiskLevel.CAUTION
+    assert "movement toward edge" in result.reasons[-1]
