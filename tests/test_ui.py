@@ -423,3 +423,117 @@ def test_calibrate_bed_uses_custom_label(blank_frame, fake_opencv):
 
     assert result is not None
     assert result.label == "MAT"
+
+
+# ---------------------------------------------------------------------------
+# Live bed ROI calibration
+# ---------------------------------------------------------------------------
+
+
+LIVE_CALIB_WIN = "Live Calibration Test"
+
+
+def test_calibrate_bed_live_rejects_non_callable():
+    renderer = ui.OverlayRenderer()
+    with pytest.raises(TypeError, match="read_frame must be callable"):
+        renderer.calibrate_bed_live("not callable")  # type: ignore[arg-type]
+
+
+def test_calibrate_bed_live_renders_multiple_frames(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    frames = [blank_frame.copy() for _ in range(5)]
+    call_count = [0]
+
+    def read_frame() -> tuple[bool, np.ndarray]:
+        idx = call_count[0]
+        call_count[0] += 1
+        if idx < len(frames):
+            return True, frames[idx]
+        return False, np.zeros((480, 640, 3), dtype=np.uint8)
+
+    # Queue "no key" for a few iterations so multiple frames are rendered,
+    # then confirm the initial region.
+    for _ in range(3):
+        fake_opencv.queue_key(0)
+    fake_opencv.queue_key(13)
+
+    initial = ui.BedBoundary(
+        points=[(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)]
+    )
+    result = renderer.calibrate_bed_live(
+        read_frame, initial_region=initial, window_name=LIVE_CALIB_WIN
+    )
+
+    assert result is not None
+    assert call_count[0] >= 3
+    assert LIVE_CALIB_WIN not in fake_opencv._window_visible
+    assert LIVE_CALIB_WIN not in fake_opencv._mouse_callbacks
+
+
+def test_calibrate_bed_live_confirms_dragged_roi(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+
+    def read_frame() -> tuple[bool, np.ndarray]:
+        return True, blank_frame
+
+    # Let a couple of live frames render, then drag a ROI and confirm.
+    fake_opencv.queue_key(0)
+    fake_opencv.queue_key(0)
+    fake_opencv.queue_mouse(LIVE_CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, 100, 100, 0)
+    fake_opencv.queue_mouse(LIVE_CALIB_WIN, fake_opencv.EVENT_MOUSEMOVE, 300, 250, 0)
+    fake_opencv.queue_mouse(LIVE_CALIB_WIN, fake_opencv.EVENT_LBUTTONUP, 300, 250, 0)
+    fake_opencv.queue_key(13)
+
+    result = renderer.calibrate_bed_live(read_frame, window_name=LIVE_CALIB_WIN)
+
+    assert result is not None
+    xs = [p[0] for p in result.points]
+    ys = [p[1] for p in result.points]
+    assert min(xs) == pytest.approx(100 / 640, abs=1e-6)
+    assert max(xs) == pytest.approx(300 / 640, abs=1e-6)
+    assert min(ys) == pytest.approx(100 / 480, abs=1e-6)
+    assert max(ys) == pytest.approx(250 / 480, abs=1e-6)
+
+
+def test_calibrate_bed_live_handles_temporary_read_failure(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    results = [False, True]
+    idx = [0]
+
+    def read_frame() -> tuple[bool, np.ndarray]:
+        i = idx[0]
+        idx[0] += 1
+        if i < len(results):
+            return (results[i], blank_frame) if results[i] else (False, blank_frame)
+        return True, blank_frame
+
+    initial = ui.BedBoundary(
+        points=[(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)]
+    )
+    fake_opencv.queue_key(0)
+    fake_opencv.queue_key(13)
+
+    result = renderer.calibrate_bed_live(
+        read_frame, initial_region=initial, window_name=LIVE_CALIB_WIN
+    )
+
+    assert result is not None
+    assert idx[0] >= 2
+    xs = [p[0] for p in result.points]
+    assert min(xs) == pytest.approx(0.2)
+    assert max(xs) == pytest.approx(0.8)
+
+
+def test_calibrate_bed_live_returns_none_on_cancel(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+
+    def read_frame() -> tuple[bool, np.ndarray]:
+        return True, blank_frame
+
+    fake_opencv.queue_key(27)
+
+    result = renderer.calibrate_bed_live(read_frame, window_name=LIVE_CALIB_WIN)
+
+    assert result is None
+    assert LIVE_CALIB_WIN not in fake_opencv._window_visible
+    assert LIVE_CALIB_WIN not in fake_opencv._mouse_callbacks

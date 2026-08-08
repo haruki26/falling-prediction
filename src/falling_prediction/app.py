@@ -7,11 +7,11 @@ import time
 import cv2
 import numpy as np
 
-from .config import AppConfig, ConfigurationError, load_bed_region, save_bed_region
+from .config import AppConfig, load_bed_region, save_bed_region
 from .openvino_pose import PoseEstimator
 from .pose_decoder import decode_poses
 from .risk import BedRegion, RiskEvaluator
-from .ui import Joint, OverlayRenderer, PersonSkeleton, RiskStatus, Telemetry
+from .ui import BedBoundary, Joint, OverlayRenderer, PersonSkeleton, RiskStatus, Telemetry
 
 
 def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> None:
@@ -20,23 +20,25 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
         raise RuntimeError(f"could not open camera {config.camera_index}")
     renderer = renderer or OverlayRenderer()
     try:
-        ok, calibration_frame = cap.read()
-        if not ok:
-            raise RuntimeError("could not read a frame for bed calibration")
         explicit = (config.bed_left, config.bed_top, config.bed_right, config.bed_bottom)
         if all(value is not None for value in explicit):
             assert all(value is not None for value in explicit)
             region_values = tuple(float(value) for value in explicit)  # type: ignore[arg-type]
         else:
-            saved = None if config.calibrate else load_bed_region(config.calibration_file)
-            if saved is None:
-                initial = None
-                selected = renderer.calibrate_bed(calibration_frame, initial_region=initial)
+            saved = load_bed_region(config.calibration_file)
+            if saved is None or config.calibrate:
+                initial = (
+                    BedBoundary(points=[(saved[0], saved[1]), (saved[2], saved[1]),
+                                         (saved[2], saved[3]), (saved[0], saved[3])])
+                    if saved is not None else None
+                )
+                selected = renderer.calibrate_bed_live(cap.read, initial_region=initial)
                 if selected is None:
                     print("Bed calibration cancelled; exiting.")
                     return
-                region_values = (selected.points[0][0], selected.points[0][1],
-                                 selected.points[2][0], selected.points[2][1])
+                xs = [point[0] for point in selected.points]
+                ys = [point[1] for point in selected.points]
+                region_values = (min(xs), min(ys), max(xs), max(ys))
                 save_bed_region(config.calibration_file, region_values)
             else:
                 region_values = saved
@@ -46,13 +48,9 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
                 raise ValueError("model path is required")
             estimator = PoseEstimator(config.model_path, config.device)
         previous = time.perf_counter()
-        pending_frame = calibration_frame
         while True:
-            if pending_frame is not None:
-                frame, pending_frame = pending_frame, None
-            else:
-                ok, frame = cap.read()
-                if not ok: break
+            ok, frame = cap.read()
+            if not ok: break
             started = time.perf_counter()
             pafs, heatmaps = estimator.infer(frame)
             poses, scores = decode_poses(pafs, heatmaps)

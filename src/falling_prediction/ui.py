@@ -12,7 +12,7 @@ Hershey fonts.  Pass ``labels`` to localize or use caller-provided copy.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -377,6 +377,144 @@ class OverlayRenderer:
         if self._calib_cancelled or self._calib_selection is None:
             return None
 
+        selection = self._calib_selection
+        (x1, y1), (x2, y2) = selection
+        x1, x2 = sorted(
+            [max(0, min(width, x1)) / width, max(0, min(width, x2)) / width]
+        )
+        y1, y2 = sorted(
+            [max(0, min(height, y1)) / height, max(0, min(height, y2)) / height]
+        )
+        return BedBoundary(
+            points=[
+                (x1, y1),
+                (x2, y1),
+                (x2, y2),
+                (x1, y2),
+            ],
+            label=self.labels.get("bed", "BED"),
+        )
+
+    def calibrate_bed_live(
+        self,
+        read_frame: Callable[[], tuple[bool, np.ndarray]],
+        initial_region: BedBoundary | None = None,
+        *,
+        window_name: str | None = None,
+        timeout_ms: int = 33,
+    ) -> BedBoundary | None:
+        """Run interactive bed ROI calibration on a live camera feed.
+
+        Frames are continuously read via ``read_frame`` and shown in a dedicated
+        calibration window.  The in-progress ROI is overlaid on each new frame
+        while the user drags.  Temporary read failures are handled gracefully:
+        the last good frame is kept until a new one arrives.
+
+        Keys
+        ----
+        Enter / Space
+            Confirm the current selection and close the window.
+        R / r
+            Reset the selection to ``initial_region`` (or clear it if none).
+        Esc
+            Cancel and close the window.
+
+        Parameters
+        ----------
+        read_frame
+            Callable returning ``(success, frame)``.  ``frame`` must be a
+            3-channel BGR image when ``success`` is ``True``.
+        initial_region
+            Optional starting bed boundary in normalized coordinates.
+        window_name
+            Optional calibration window name.  Defaults to
+            ``"{monitor_window} - Bed Calibration"``.
+        timeout_ms
+            Maximum time to wait for a key each frame (default 33 ms, ~30 FPS).
+            This prevents busy looping.
+
+        Returns
+        -------
+        BedBoundary | None
+            Normalized rectangular boundary confirmed by the user, or ``None``
+            if cancelled or no valid frame was ever available to normalize
+            against.  The caller can retain the latest valid frame by calling
+            ``read_frame`` after calibration returns.
+        """
+        if not callable(read_frame):
+            raise TypeError("read_frame must be callable")
+
+        win = window_name or f"{self.window_name} - Bed Calibration"
+        self._calib_cancelled = False
+        self._calib_confirmed = False
+        self._calib_current_frame: np.ndarray | None = None
+
+        fallback = np.zeros((480, 640, 3), dtype=np.uint8)
+        have_valid_frame = False
+        last_valid_shape: tuple[int, ...] | None = None
+
+        # Initialize selection using fallback dimensions so the overlay can be
+        # drawn before the first live frame arrives.  It is rescaled when the
+        # first valid frame is read.
+        self._reset_calib_selection(fallback.shape, initial_region)
+
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(win, self._on_calib_mouse)
+
+        try:
+            while not self._calib_cancelled and not self._calib_confirmed:
+                success, frame = read_frame()
+                if (
+                    success
+                    and frame is not None
+                    and frame.ndim == 3
+                    and frame.shape[2] == 3
+                ):
+                    self._calib_current_frame = frame.copy()
+                    last_valid_shape = self._calib_current_frame.shape
+                    if not have_valid_frame:
+                        have_valid_frame = True
+                        self._reset_calib_selection(
+                            self._calib_current_frame.shape, initial_region
+                        )
+                elif self._calib_current_frame is None:
+                    self._calib_current_frame = fallback
+
+                display_frame = self._calib_current_frame
+                assert display_frame is not None
+                height, width = display_frame.shape[:2]
+                display = self._draw_calibration_overlay(
+                    display_frame, width, height
+                )
+                cv2.imshow(win, display)
+
+                key = cv2.waitKey(timeout_ms) & 0xFF
+                if key == 27:  # Esc
+                    self._calib_cancelled = True
+                elif key in (13, 32):  # Enter / Space
+                    if self._calib_selection is not None and have_valid_frame:
+                        self._calib_confirmed = True
+                elif key in (ord("r"), ord("R")):
+                    if have_valid_frame and self._calib_current_frame is not None:
+                        self._reset_calib_selection(
+                            self._calib_current_frame.shape, initial_region
+                        )
+                    else:
+                        self._reset_calib_selection(fallback.shape, initial_region)
+        finally:
+            cv2.setMouseCallback(win, lambda *args, **kwargs: None)
+            cv2.destroyWindow(win)
+            self._calib_current_frame = None
+
+        if (
+            self._calib_cancelled
+            or self._calib_selection is None
+            or not have_valid_frame
+            or last_valid_shape is None
+        ):
+            return None
+
+        height, width = last_valid_shape[:2]
         selection = self._calib_selection
         (x1, y1), (x2, y2) = selection
         x1, x2 = sorted(
