@@ -9,6 +9,10 @@ import cv2
 import numpy as np
 
 INPUT_SHAPE = (1, 3, 256, 456)
+PAF_NAME = "Mconv7_stage2_L1"
+HEATMAP_NAME = "Mconv7_stage2_L2"
+PAF_SHAPE = (1, 38, 32, 57)
+HEATMAP_SHAPE = (1, 19, 32, 57)
 
 
 def available_devices() -> tuple[str, ...]:
@@ -40,21 +44,39 @@ class PoseEstimator:
             raise ValueError(
                 f"human-pose-estimation-0001 input must be {INPUT_SHAPE}, got {shape}"
             )
-        outputs = list(self.model.outputs)
+        required = {PAF_NAME: PAF_SHAPE, HEATMAP_NAME: HEATMAP_SHAPE}
         found: dict[str, Any] = {}
-        for output in outputs:
-            dims = tuple(int(x) for x in output.shape)
-            _channels = dims[1] if len(dims) == 4 else -1
-            if dims == (1, 38, 32, 57):
-                found["paf"] = output
-            elif dims == (1, 19, 32, 57):
-                found["heatmap"] = output
-        if set(found) != {"paf", "heatmap"}:
+        for output in self.model.outputs:
+            names = {str(name) for name in output.get_names()}
+            for name, expected_shape in required.items():
+                if name in names:
+                    shape = tuple(int(x) for x in output.shape)
+                    if shape != expected_shape:
+                        raise ValueError(
+                            f"output {name} must have shape {expected_shape}, got {shape}"
+                        )
+                    found[name] = output
+        if set(found) != set(required):
             raise ValueError(
-                "model must expose PAF [1,38,32,57] and heatmap [1,19,32,57]"
+                "model must expose exact outputs "
+                f"{PAF_NAME} {PAF_SHAPE} and {HEATMAP_NAME} {HEATMAP_SHAPE}"
             )
-        self.paf_output, self.heatmap_output = found["paf"], found["heatmap"]
         self.compiled_model = core.compile_model(self.model, self.device)
+        self._request = self.compiled_model.create_infer_request()
+
+        # Keep integer indexes only.  A model Output is not a valid key for
+        # the result map on all OpenVINO versions (notably Windows builds).
+        compiled_indexes: dict[str, int] = {}
+        for index, output in enumerate(self.compiled_model.outputs):
+            names = {str(name) for name in output.get_names()}
+            for name in required:
+                if name in names:
+                    compiled_indexes[name] = index
+        if set(compiled_indexes) != set(required):
+            raise ValueError("compiled model lost one or more required named outputs")
+        self._paf_index = compiled_indexes[PAF_NAME]
+        self._heatmap_index = compiled_indexes[HEATMAP_NAME]
+        self._input_name = self.model.input(0).get_any_name()
 
     def infer(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if image.ndim != 3 or image.shape[2] != 3:
@@ -64,7 +86,7 @@ class PoseEstimator:
             .transpose(2, 0, 1)[None]
             .astype(np.float32)
         )
-        result = self.compiled_model([tensor])
-        return np.asarray(result[self.paf_output]), np.asarray(
-            result[self.heatmap_output]
-        )
+        self._request.infer({self._input_name: tensor})
+        paf = np.asarray(self._request.get_output_tensor(self._paf_index).data)
+        heatmap = np.asarray(self._request.get_output_tensor(self._heatmap_index).data)
+        return paf, heatmap
