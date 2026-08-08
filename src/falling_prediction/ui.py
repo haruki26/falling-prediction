@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -148,6 +148,12 @@ DEFAULT_REASON_TRANSLATIONS: dict[str, str] = {
     "upper body raised": "Upper body raised",
     "rapid movement toward edge": "Rapid movement toward edge",
 }
+
+# ASCII-safe calibration instructions (OpenCV Hershey fonts).
+_CALIB_INSTRUCTIONS = (
+    "DRAG TO SELECT",
+    "ENTER/SPACE CONFIRM   R RESET   ESC CANCEL",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +305,95 @@ class OverlayRenderer:
             except cv2.error:
                 pass
             self._window_created = False
+
+    def calibrate_bed(
+        self,
+        frame: np.ndarray,
+        initial_region: BedBoundary | None = None,
+        *,
+        window_name: str | None = None,
+    ) -> BedBoundary | None:
+        """Run an interactive bed ROI calibration on a frozen camera frame.
+
+        The frame is shown in a dedicated window.  The user drags the left
+        mouse button to draw or adjust a rectangular bed region.  The current
+        selection is shaded and outlined, and ASCII-safe instructions are
+        drawn at the bottom of the window.
+
+        Keys
+        ----
+        Enter / Space
+            Confirm the current selection and close the window.
+        R / r
+            Reset the selection to ``initial_region`` (or clear it if none).
+        Esc
+            Cancel and close the window.
+
+        Parameters
+        ----------
+        frame
+            3-channel BGR image to calibrate on.  It is not modified.
+        initial_region
+            Optional starting bed boundary in normalized coordinates.
+        window_name
+            Optional calibration window name.  Defaults to
+            ``"{monitor_window} - Bed Calibration"``.
+
+        Returns
+        -------
+        BedBoundary | None
+            Normalized rectangular boundary, or ``None`` if cancelled.
+        """
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError("frame must be a 3-channel BGR image")
+
+        height, width = frame.shape[:2]
+        win = window_name or f"{self.window_name} - Bed Calibration"
+
+        self._calib_cancelled = False
+        self._calib_confirmed = False
+        self._reset_calib_selection(frame.shape, initial_region)
+
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.imshow(win, self._draw_calibration_overlay(frame, width, height))
+        cv2.setMouseCallback(win, self._on_calib_mouse)
+
+        try:
+            while not self._calib_cancelled and not self._calib_confirmed:
+                display = self._draw_calibration_overlay(frame, width, height)
+                cv2.imshow(win, display)
+                key = cv2.waitKey(30) & 0xFF
+                if key == 27:  # Esc
+                    self._calib_cancelled = True
+                elif key in (13, 32):  # Enter / Space
+                    if self._calib_selection is not None:
+                        self._calib_confirmed = True
+                elif key in (ord("r"), ord("R")):
+                    self._reset_calib_selection(frame.shape, initial_region)
+        finally:
+            cv2.setMouseCallback(win, lambda *args, **kwargs: None)
+            cv2.destroyWindow(win)
+
+        if self._calib_cancelled or self._calib_selection is None:
+            return None
+
+        selection = self._calib_selection
+        (x1, y1), (x2, y2) = selection
+        x1, x2 = sorted(
+            [max(0, min(width, x1)) / width, max(0, min(width, x2)) / width]
+        )
+        y1, y2 = sorted(
+            [max(0, min(height, y1)) / height, max(0, min(height, y2)) / height]
+        )
+        return BedBoundary(
+            points=[
+                (x1, y1),
+                (x2, y1),
+                (x2, y2),
+                (x1, y2),
+            ],
+            label=self.labels.get("bed", "BED"),
+        )
 
     # -- Drawing internals --------------------------------------------------
 
@@ -664,3 +759,96 @@ class OverlayRenderer:
             1,
             cv2.LINE_AA,
         )
+
+    # -- Calibration helpers -------------------------------------------------
+
+    def _on_calib_mouse(
+        self, event: int, x: int, y: int, flags: int, param: Any
+    ) -> None:
+        """Mouse callback for the bed calibration window."""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self._calib_start = (x, y)
+            self._calib_end = (x, y)
+            self._calib_drawing = True
+            self._calib_selection = (self._calib_start, self._calib_end)
+        elif event == cv2.EVENT_MOUSEMOVE and self._calib_drawing:
+            self._calib_end = (x, y)
+            self._calib_selection = (self._calib_start, self._calib_end)
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._calib_drawing = False
+            self._calib_end = (x, y)
+            self._calib_selection = (self._calib_start, self._calib_end)
+
+    def _reset_calib_selection(
+        self,
+        frame_shape: tuple[int, ...],
+        initial_region: BedBoundary | None,
+    ) -> None:
+        """Reset the calibration selection to ``initial_region`` or clear it."""
+        height, width = frame_shape[:2]
+        if initial_region is not None:
+            xs = [p[0] for p in initial_region.points]
+            ys = [p[1] for p in initial_region.points]
+            x1 = int(min(xs) * width)
+            x2 = int(max(xs) * width)
+            y1 = int(min(ys) * height)
+            y2 = int(max(ys) * height)
+            self._calib_start = (x1, y1)
+            self._calib_end = (x2, y2)
+            self._calib_selection = ((x1, y1), (x2, y2))
+        else:
+            self._calib_start = None
+            self._calib_end = None
+            self._calib_selection = None
+        self._calib_drawing = False
+
+    def _draw_calibration_overlay(
+        self, frame: np.ndarray, width: int, height: int
+    ) -> np.ndarray:
+        """Return a copy of ``frame`` with the current selection and instructions."""
+        display = frame.copy()
+
+        if self._calib_selection is not None:
+            (x1, y1), (x2, y2) = self._calib_selection
+            x1, x2 = sorted([max(0, min(width, x1)), max(0, min(width, x2))])
+            y1, y2 = sorted([max(0, min(height, y1)), max(0, min(height, y2))])
+
+            if x2 > x1 and y2 > y1:
+                overlay = display.copy()
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), PALETTE["bed_glow"], -1)
+                cv2.addWeighted(
+                    overlay, self.panel_alpha, display, 1 - self.panel_alpha, 0, display
+                )
+                cv2.rectangle(
+                    display, (x1, y1), (x2, y2), PALETTE["bed"], 2, cv2.LINE_AA
+                )
+
+        self._draw_instruction_strip(display)
+        return display
+
+    def _draw_instruction_strip(self, display: np.ndarray) -> None:
+        """Draw the calibration instruction strip at the bottom of the frame."""
+        height, width = display.shape[:2]
+        margin = max(10, int(width * 0.015))
+        line_height = int(self.font_scale * 28)
+        panel_h = margin * 2 + len(_CALIB_INSTRUCTIONS) * line_height
+
+        overlay = display.copy()
+        cv2.rectangle(overlay, (0, height - panel_h), (width, height), PALETTE["panel_bg"], -1)
+        cv2.addWeighted(
+            overlay, self.panel_alpha, display, 1 - self.panel_alpha, 0, display
+        )
+
+        y = height - panel_h + margin + int(self.font_scale * 20)
+        for line in _CALIB_INSTRUCTIONS:
+            cv2.putText(
+                display,
+                line,
+                (margin, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                self.font_scale,
+                PALETTE["text"],
+                1,
+                cv2.LINE_AA,
+            )
+            y += line_height

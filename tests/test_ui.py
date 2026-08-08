@@ -22,6 +22,12 @@ class _FakeCv2(ModuleType):
     LINE_AA = 16
     WND_PROP_VISIBLE = 1
 
+    EVENT_LBUTTONDOWN = 1
+    EVENT_MOUSEMOVE = 0
+    EVENT_LBUTTONUP = 4
+
+    WINDOW_NORMAL = 1
+
     class error(Exception):
         pass
 
@@ -29,21 +35,46 @@ class _FakeCv2(ModuleType):
         super().__init__("cv2")
         self._last_key = -1
         self._window_visible: dict[str, float] = {}
+        self._mouse_callbacks: dict[str, tuple[Any, Any]] = {}
+        self._mouse_event_queue: list[tuple[str, int, int, int, int]] = []
+        self._key_queue: list[int] = []
 
     def imshow(self, winname: str, mat: Any) -> None:
         self._window_visible[winname] = 1.0
 
+    def namedWindow(self, winname: str, flags: int = 0) -> None:
+        self._window_visible[winname] = 1.0
+
+    def setMouseCallback(self, winname: str, onMouse: Any, param: Any = None) -> None:
+        self._mouse_callbacks[winname] = (onMouse, param)
+
     def waitKey(self, delay: int = 0) -> int:
+        # Dispatch any queued synthetic mouse events first, then return the
+        # next queued key (falling back to the single last-key value).
+        for winname, event, x, y, flags in self._mouse_event_queue:
+            callback, param = self._mouse_callbacks.get(winname, (None, None))
+            if callback is not None:
+                callback(event, x, y, flags, param)
+        self._mouse_event_queue.clear()
+        if self._key_queue:
+            return self._key_queue.pop(0)
         return self._last_key
 
     def set_next_key(self, key: int) -> None:
         self._last_key = key
+
+    def queue_key(self, key: int) -> None:
+        self._key_queue.append(key)
+
+    def queue_mouse(self, winname: str, event: int, x: int, y: int, flags: int = 0) -> None:
+        self._mouse_event_queue.append((winname, event, x, y, flags))
 
     def getWindowProperty(self, winname: str, prop: int) -> float:
         return self._window_visible.get(winname, 1.0)
 
     def destroyWindow(self, winname: str) -> None:
         self._window_visible.pop(winname, None)
+        self._mouse_callbacks.pop(winname, None)
 
     def getTextSize(self, text: str, fontFace: int, fontScale: float, thickness: int) -> tuple[tuple[int, int], int]:
         # Rough approximation so panel sizing stays deterministic.
@@ -78,8 +109,11 @@ from falling_prediction.risk import BedRegion, RiskEvaluator, RiskLevel, RiskRes
 
 
 @pytest.fixture
-def fake_opencv() -> _FakeCv2:
-    return sys.modules["cv2"]  # type: ignore[return-value]
+def fake_opencv(monkeypatch) -> _FakeCv2:
+    fake = _FakeCv2()
+    monkeypatch.setitem(sys.modules, "cv2", fake)
+    monkeypatch.setattr(ui, "cv2", fake)
+    return fake
 
 
 @pytest.fixture
@@ -281,3 +315,111 @@ def test_end_to_end_with_risk_evaluator(blank_frame):
     out = renderer.render(blank_frame, telemetry, risk=status, bed_boundary=bed)
     assert out.shape == blank_frame.shape
     assert status.level == "safe"
+
+
+# ---------------------------------------------------------------------------
+# Bed ROI calibration
+# ---------------------------------------------------------------------------
+
+
+CALIB_WIN = "Calibration Test"
+
+
+def test_calibrate_bed_rejects_invalid_frame():
+    renderer = ui.OverlayRenderer()
+    with pytest.raises(ValueError, match="3-channel BGR image"):
+        renderer.calibrate_bed(np.zeros((480, 640), dtype=np.uint8))
+
+
+def test_calibrate_bed_returns_selection_on_confirm(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, 100, 100, 0)
+    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_MOUSEMOVE, 300, 250, 0)
+    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONUP, 300, 250, 0)
+    fake_opencv.queue_key(13)  # Enter
+
+    result = renderer.calibrate_bed(blank_frame, window_name=CALIB_WIN)
+
+    assert result is not None
+    xs = [p[0] for p in result.points]
+    ys = [p[1] for p in result.points]
+    assert min(xs) == pytest.approx(100 / 640, abs=1e-6)
+    assert max(xs) == pytest.approx(300 / 640, abs=1e-6)
+    assert min(ys) == pytest.approx(100 / 480, abs=1e-6)
+    assert max(ys) == pytest.approx(250 / 480, abs=1e-6)
+    assert result.label == "BED"
+
+
+def test_calibrate_bed_returns_none_on_cancel(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    fake_opencv.queue_key(27)  # Esc
+
+    result = renderer.calibrate_bed(blank_frame, window_name=CALIB_WIN)
+
+    assert result is None
+
+
+def test_calibrate_bed_cleans_up_window(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    fake_opencv.queue_key(27)
+
+    renderer.calibrate_bed(blank_frame, window_name=CALIB_WIN)
+
+    assert CALIB_WIN not in fake_opencv._window_visible
+    assert CALIB_WIN not in fake_opencv._mouse_callbacks
+
+
+def test_calibrate_bed_uses_initial_region(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    initial = ui.BedBoundary(
+        points=[(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)]
+    )
+    fake_opencv.queue_key(13)  # Enter
+
+    result = renderer.calibrate_bed(
+        blank_frame, initial_region=initial, window_name=CALIB_WIN
+    )
+
+    assert result is not None
+    xs = [p[0] for p in result.points]
+    ys = [p[1] for p in result.points]
+    assert min(xs) == pytest.approx(0.2)
+    assert max(xs) == pytest.approx(0.8)
+    assert min(ys) == pytest.approx(0.2)
+    assert max(ys) == pytest.approx(0.8)
+
+
+def test_calibrate_bed_reset_restores_initial_region(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    initial = ui.BedBoundary(
+        points=[(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)]
+    )
+    # Drag a different region, reset, then confirm.
+    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, 10, 10, 0)
+    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONUP, 50, 50, 0)
+    fake_opencv.queue_key(ord("r"))
+    fake_opencv.queue_key(13)
+
+    result = renderer.calibrate_bed(
+        blank_frame, initial_region=initial, window_name=CALIB_WIN
+    )
+
+    assert result is not None
+    xs = [p[0] for p in result.points]
+    assert min(xs) == pytest.approx(0.2)
+    assert max(xs) == pytest.approx(0.8)
+
+
+def test_calibrate_bed_uses_custom_label(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer(labels={"bed": "MAT"})
+    initial = ui.BedBoundary(
+        points=[(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)]
+    )
+    fake_opencv.queue_key(13)
+
+    result = renderer.calibrate_bed(
+        blank_frame, initial_region=initial, window_name=CALIB_WIN
+    )
+
+    assert result is not None
+    assert result.label == "MAT"

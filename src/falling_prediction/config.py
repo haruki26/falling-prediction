@@ -17,10 +17,12 @@ class AppConfig:
     camera_index: int = 0
     model_path: Path | None = None
     device: str = "CPU"
-    bed_left: float = 0.10
-    bed_top: float = 0.10
-    bed_right: float = 0.90
-    bed_bottom: float = 0.90
+    bed_left: float | None = None
+    bed_top: float | None = None
+    bed_right: float | None = None
+    bed_bottom: float | None = None
+    calibrate: bool = False
+    calibration_file: Path = Path("bed_roi.json")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,6 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
             type=float,
             help=f"normalized bed rectangle {name} (default from 0.10/0.90)",
         )
+    parser.add_argument("--calibrate", action="store_true", help="force interactive bed calibration")
+    parser.add_argument("--calibration-file", type=Path, default=Path("bed_roi.json"),
+                        help="versioned bed ROI JSON (default: ./bed_roi.json)")
     return parser
 
 
@@ -63,10 +68,8 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
         args.camera_index,
         args.model_path,
         args.device,
-        args.bed_left if args.bed_left is not None else 0.10,
-        args.bed_top if args.bed_top is not None else 0.10,
-        args.bed_right if args.bed_right is not None else 0.90,
-        args.bed_bottom if args.bed_bottom is not None else 0.90,
+        args.bed_left, args.bed_top, args.bed_right, args.bed_bottom,
+        args.calibrate, args.calibration_file,
     )
 
 
@@ -84,10 +87,16 @@ def validate_config(
         raise ConfigurationError("camera index must be >= 0")
     if config.device not in {"CPU", "GPU", "NPU"}:
         raise ConfigurationError("device must be one of CPU, GPU, or NPU")
-    if not (
-        0 <= config.bed_left < config.bed_right <= 1
-        and 0 <= config.bed_top < config.bed_bottom <= 1
-    ):
+    bed_values = (config.bed_left, config.bed_top, config.bed_right, config.bed_bottom)
+    if any(value is not None for value in bed_values) and not all(value is not None for value in bed_values):
+        raise ConfigurationError("all four bed overrides must be supplied together")
+    if all(value is not None for value in bed_values):
+        left, top, right, bottom = bed_values
+        assert left is not None and top is not None and right is not None and bottom is not None
+        valid_bed = 0 <= left < right <= 1 and 0 <= top < bottom <= 1
+    else:
+        valid_bed = True
+    if not valid_bed:
         raise ConfigurationError(
             "bed rectangle must satisfy 0 <= left < right <= 1 and 0 <= top < bottom <= 1"
         )
@@ -116,3 +125,32 @@ def validate_config(
             f"camera index {config.camera_index} could not be opened"
         )
     return config
+
+
+def load_bed_region(path: Path) -> tuple[float, float, float, float] | None:
+    """Load a versioned normalized ROI, rejecting malformed files explicitly."""
+    import json
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") != 1:
+            raise ValueError("unsupported version")
+        values = tuple(float(data[name]) for name in ("left", "top", "right", "bottom"))
+        if not all(__import__("math").isfinite(value) for value in values):
+            raise ValueError("coordinates must be finite")
+        left, top, right, bottom = values
+        if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+            raise ValueError("coordinates must form a normalized rectangle")
+        return (values[0], values[1], values[2], values[3])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"invalid calibration file {path}: {exc}") from exc
+
+
+def save_bed_region(path: Path, region: tuple[float, float, float, float]) -> None:
+    import json
+    left, top, right, bottom = region
+    if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+        raise ConfigurationError("cannot save invalid normalized bed rectangle")
+    path.write_text(json.dumps({"version": 1, "left": left, "top": top,
+                                "right": right, "bottom": bottom}, indent=2) + "\n", encoding="utf-8")

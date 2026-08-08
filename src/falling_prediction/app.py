@@ -7,7 +7,7 @@ import time
 import cv2
 import numpy as np
 
-from .config import AppConfig
+from .config import AppConfig, ConfigurationError, load_bed_region, save_bed_region
 from .openvino_pose import PoseEstimator
 from .pose_decoder import decode_poses
 from .risk import BedRegion, RiskEvaluator
@@ -15,23 +15,44 @@ from .ui import Joint, OverlayRenderer, PersonSkeleton, RiskStatus, Telemetry
 
 
 def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> None:
-    cap = capture or cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW)
+    cap = capture if capture is not None else cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
         raise RuntimeError(f"could not open camera {config.camera_index}")
-    if estimator is None:
-        if config.model_path is None:
-            raise ValueError("model path is required")
-        estimator = PoseEstimator(config.model_path, config.device)
     renderer = renderer or OverlayRenderer()
-    evaluator = RiskEvaluator(
-        BedRegion(config.bed_left, config.bed_top, config.bed_right, config.bed_bottom)
-    )
-    previous = time.perf_counter()
     try:
+        ok, calibration_frame = cap.read()
+        if not ok:
+            raise RuntimeError("could not read a frame for bed calibration")
+        explicit = (config.bed_left, config.bed_top, config.bed_right, config.bed_bottom)
+        if all(value is not None for value in explicit):
+            assert all(value is not None for value in explicit)
+            region_values = tuple(float(value) for value in explicit)  # type: ignore[arg-type]
+        else:
+            saved = None if config.calibrate else load_bed_region(config.calibration_file)
+            if saved is None:
+                initial = None
+                selected = renderer.calibrate_bed(calibration_frame, initial_region=initial)
+                if selected is None:
+                    print("Bed calibration cancelled; exiting.")
+                    return
+                region_values = (selected.points[0][0], selected.points[0][1],
+                                 selected.points[2][0], selected.points[2][1])
+                save_bed_region(config.calibration_file, region_values)
+            else:
+                region_values = saved
+        evaluator = RiskEvaluator(BedRegion(*region_values))
+        if estimator is None:
+            if config.model_path is None:
+                raise ValueError("model path is required")
+            estimator = PoseEstimator(config.model_path, config.device)
+        previous = time.perf_counter()
+        pending_frame = calibration_frame
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+            if pending_frame is not None:
+                frame, pending_frame = pending_frame, None
+            else:
+                ok, frame = cap.read()
+                if not ok: break
             started = time.perf_counter()
             pafs, heatmaps = estimator.infer(frame)
             poses, scores = decode_poses(pafs, heatmaps)

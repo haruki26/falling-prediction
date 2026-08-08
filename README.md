@@ -10,8 +10,14 @@ python scripts/download_model.py
 uv run falling-prediction --model models/human-pose-estimation-0001/human-pose-estimation-0001.xml --device CPU
 ```
 
-Use `--bed-left`, `--bed-top`, `--bed-right`, and `--bed-bottom` for a normalized
-rectangular bed. Press **Esc** to stop. Model XML/BIN files are not committed.
+On first startup the app opens the camera and calibrates the bed, saving a
+versioned normalized rectangle to `./bed_roi.json`. Use
+`--calibration-file PATH` to choose another file, or `--calibrate` to force a
+new calibration. Drag with the left mouse button, then press **Enter** or
+**Space** to confirm; press **R** to reset or **Esc** to cancel and exit.
+Use `--bed-left`, `--bed-top`, `--bed-right`, and `--bed-bottom` together as
+explicit normalized rectangular-bed overrides; these skip calibration.
+Press **Esc** in the monitoring window to stop. Model XML/BIN files are not committed.
 The downloader retrieves the official 2023.0 FP32 IR and verifies its SHA-384
 checksums. The model contract is input `[1,3,256,456]` BGR, PAF output
 `[1,38,32,57]`, and heatmap output `[1,19,32,57]`. The decoder performs
