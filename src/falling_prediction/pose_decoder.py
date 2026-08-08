@@ -312,7 +312,7 @@ class OpenPoseDecoder:
     def convert_to_coco_format(pose_entries, all_keypoints):
         poses, scores = [], []
         for pose in pose_entries:
-            keypoints = np.zeros(18 * 3, dtype=np.float32)
+            keypoints = np.zeros(17 * 3, dtype=np.float32)
             for target_id, source_id in enumerate(COCO_FROM_OPENPOSE):
                 point_id = int(pose[source_id])
                 if point_id >= 0:
