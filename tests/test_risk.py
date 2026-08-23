@@ -6,6 +6,9 @@ from falling_prediction.risk import (
     RiskEvaluator,
     RiskLevel,
 )
+import pytest
+
+from falling_prediction.risk import BedRegion, RiskEvaluator, RiskLevel
 
 
 def pose(x=0.5, y=0.5):
@@ -96,3 +99,17 @@ def test_movement_toward_edge_is_temporal_signal():
     assert result.score == 2
     assert result.level is RiskLevel.CAUTION
     assert "movement toward edge" in result.reasons[-1]
+
+
+def test_polygon_containment_and_edge_distance_are_used():
+    bed = BedRegion(points=((0.2, 0.2), (0.8, 0.3), (0.7, 0.8), (0.25, 0.7)))
+    assert bed.contains((0.5, 0.5))
+    assert not bed.contains((0.05, 0.5))
+    assert bed.distance_to_edges((0.2, 0.2)) == pytest.approx(0)
+
+
+def test_bed_polygon_requires_exactly_four_valid_points():
+    with pytest.raises(ValueError):
+        BedRegion(points=((0, 0), (1, 0), (1, 1)))
+    with pytest.raises(ValueError):
+        BedRegion(points=((0, 0), (1, 1), (0, 1), (1, 0)))
