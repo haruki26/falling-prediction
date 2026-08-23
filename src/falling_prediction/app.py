@@ -11,16 +11,32 @@ from .config import AppConfig, load_bed_region, save_bed_region
 from .openvino_pose import PoseEstimator
 from .pose_decoder import decode_poses
 from .risk import BedRegion, RiskEvaluator
-from .ui import BedBoundary, Joint, OverlayRenderer, PersonSkeleton, RiskStatus, Telemetry
+from .ui import (
+    BedBoundary,
+    Joint,
+    OverlayRenderer,
+    PersonSkeleton,
+    RiskStatus,
+    Telemetry,
+)
 
 
 def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> None:
-    cap = capture if capture is not None else cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW)
+    cap = (
+        capture
+        if capture is not None
+        else cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW)
+    )
     if not cap.isOpened():
         raise RuntimeError(f"could not open camera {config.camera_index}")
     renderer = renderer or OverlayRenderer()
     try:
-        explicit = (config.bed_left, config.bed_top, config.bed_right, config.bed_bottom)
+        explicit = (
+            config.bed_left,
+            config.bed_top,
+            config.bed_right,
+            config.bed_bottom,
+        )
         if all(value is not None for value in explicit):
             assert all(value is not None for value in explicit)
             region_values = tuple(float(value) for value in explicit)  # type: ignore[arg-type]
@@ -28,9 +44,16 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
             saved = load_bed_region(config.calibration_file)
             if saved is None or config.calibrate:
                 initial = (
-                    BedBoundary(points=[(saved[0], saved[1]), (saved[2], saved[1]),
-                                         (saved[2], saved[3]), (saved[0], saved[3])])
-                    if saved is not None else None
+                    BedBoundary(
+                        points=[
+                            (saved[0], saved[1]),
+                            (saved[2], saved[1]),
+                            (saved[2], saved[3]),
+                            (saved[0], saved[3]),
+                        ]
+                    )
+                    if saved is not None
+                    else None
                 )
                 selected = renderer.calibrate_bed_live(cap.read, initial_region=initial)
                 if selected is None:
@@ -50,7 +73,8 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
         previous = time.perf_counter()
         while True:
             ok, frame = cap.read()
-            if not ok: break
+            if not ok:
+                break
             started = time.perf_counter()
             pafs, heatmaps = estimator.infer(frame)
             poses, scores = decode_poses(pafs, heatmaps)

@@ -182,6 +182,12 @@ class OverlayRenderer:
     ...     renderer.close()
     """
 
+    # Interactive display zoom.  The renderer composes the full-resolution
+    # frame and then crops/resizes around the center before showing it.
+    MIN_ZOOM: float = 0.5
+    MAX_ZOOM: float = 4.0
+    ZOOM_STEP: float = 1.25
+
     def __init__(
         self,
         window_name: str | None = None,
@@ -206,6 +212,7 @@ class OverlayRenderer:
         self.skeleton_confidence_threshold = skeleton_confidence_threshold
         self.show_bed_label = show_bed_label
         self._window_created = False
+        self._zoom_level: float = 1.0
 
     # -- Integration helpers ------------------------------------------------
 
@@ -275,20 +282,35 @@ class OverlayRenderer:
         return canvas
 
     def show(self, frame: np.ndarray) -> None:
-        """Display the frame using ``cv2.imshow`` (Windows-compatible)."""
-        cv2.imshow(self.window_name, frame)
+        """Display the frame using ``cv2.imshow`` (Windows-compatible).
+
+        The composed frame is cropped and resized around the center according
+        to the current interactive zoom level, then a small zoom indicator is
+        overlaid when zoomed away from 1.0x.
+        """
+        display = self._apply_zoom(frame)
+        self._draw_zoom_hint(display)
+        cv2.imshow(self.window_name, display)
         if not self._window_created:
             self._window_created = True
 
     def should_quit(self, timeout_ms: int = 1) -> bool:
         """Return True if the user pressed ESC or closed the window.
 
-        ``timeout_ms`` is passed to ``cv2.waitKey``.  Use a small value inside
-        a realtime loop.
+        This method also reads the interactive zoom keys: ``+``/``=`` zooms
+        in, ``-``/``_`` zooms out, and ``0`` resets to 1.0x.  ``timeout_ms``
+        is passed to ``cv2.waitKey``.  Use a small value inside a realtime
+        loop.
         """
         key = cv2.waitKey(timeout_ms) & 0xFF
         if key == 27:  # ESC
             return True
+        if key in (ord("+"), ord("=")):
+            self._zoom_level = min(self.MAX_ZOOM, self._zoom_level * self.ZOOM_STEP)
+        elif key in (ord("-"), ord("_")):
+            self._zoom_level = max(self.MIN_ZOOM, self._zoom_level / self.ZOOM_STEP)
+        elif key == ord("0"):
+            self._zoom_level = 1.0
         if self._window_created:
             try:
                 if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
@@ -725,6 +747,73 @@ class OverlayRenderer:
                 cv2.LINE_AA,
             )
             y += line_height
+
+    def _apply_zoom(self, frame: np.ndarray) -> np.ndarray:
+        """Crop/resize ``frame`` around its center using the current zoom level.
+
+        Zoom levels greater than 1.0x crop a centered region and upscale it
+        back to the original dimensions.  Levels below 1.0x scale the frame
+        down and letterbox it with black borders.  1.0x returns the frame
+        unchanged.
+        """
+        if math.isclose(self._zoom_level, 1.0):
+            return frame
+
+        height, width = frame.shape[:2]
+
+        if self._zoom_level > 1.0:
+            crop_w = max(1, int(width / self._zoom_level))
+            crop_h = max(1, int(height / self._zoom_level))
+            x1 = (width - crop_w) // 2
+            y1 = (height - crop_h) // 2
+            cropped = frame[y1 : y1 + crop_h, x1 : x1 + crop_w]
+            return cv2.resize(
+                cropped, (width, height), interpolation=cv2.INTER_LINEAR
+            )
+
+        # Zoom out: scale down and center on a black background.
+        new_w = max(1, int(width * self._zoom_level))
+        new_h = max(1, int(height * self._zoom_level))
+        scaled = cv2.resize(
+            frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR
+        )
+        result = np.zeros_like(frame)
+        x1 = (width - new_w) // 2
+        y1 = (height - new_h) // 2
+        result[y1 : y1 + new_h, x1 : x1 + new_w] = scaled
+        return result
+
+    def _draw_zoom_hint(self, canvas: np.ndarray) -> None:
+        """Draw a compact zoom badge when the view is not at 1.0x."""
+        if math.isclose(self._zoom_level, 1.0):
+            return
+
+        height, width = canvas.shape[:2]
+        text = f"{self._zoom_level:.1f}x   +/- zoom   0 reset"
+        font = self.font_scale * 0.72
+        (tw, th), baseline = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, font, 1
+        )
+        margin = max(8, int(width * 0.012))
+        pad = 6
+        x2 = width - margin
+        y2 = height - margin
+        x1 = x2 - tw - pad * 2
+        y1 = y2 - th - baseline - pad * 2
+
+        self._fill_round_rect(
+            canvas, (x1, y1), (x2, y2), PALETTE["panel_bg"], 6
+        )
+        cv2.putText(
+            canvas,
+            text,
+            (x1 + pad, y2 - pad - baseline),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font,
+            PALETTE["text_muted"],
+            1,
+            cv2.LINE_AA,
+        )
 
     def _draw_bed_boundary(
         self,

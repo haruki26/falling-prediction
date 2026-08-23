@@ -21,6 +21,7 @@ class _FakeCv2(ModuleType):
     FONT_HERSHEY_SIMPLEX = 0
     LINE_AA = 16
     WND_PROP_VISIBLE = 1
+    INTER_LINEAR = 1
 
     EVENT_LBUTTONDOWN = 1
     EVENT_MOUSEMOVE = 0
@@ -97,6 +98,20 @@ class _FakeCv2(ModuleType):
 
     def fillPoly(self, img: Any, pts: Any, color: Any) -> None:
         pass
+
+    def resize(
+        self,
+        src: Any,
+        dsize: tuple[int, int],
+        dst: Any = None,
+        fx: float | None = None,
+        fy: float | None = None,
+        interpolation: int | None = None,
+    ) -> Any:
+        height, width = dsize[1], dsize[0]
+        if src.ndim == 3:
+            return np.zeros((height, width, src.shape[2]), dtype=src.dtype)
+        return np.zeros((height, width), dtype=src.dtype)
 
 
 # Install the fake before importing the module under test.  This keeps the
@@ -293,6 +308,104 @@ def test_close_destroys_window(fake_opencv):
     fake_opencv.imshow(renderer.window_name, np.zeros((10, 10, 3), dtype=np.uint8))
     renderer.close()
     assert renderer._window_created is False
+
+
+# ---------------------------------------------------------------------------
+# Interactive zoom
+# ---------------------------------------------------------------------------
+
+
+def test_default_zoom_level_is_one():
+    renderer = ui.OverlayRenderer()
+    assert renderer._zoom_level == pytest.approx(1.0)
+
+
+def test_zoom_in_key_increases_zoom(fake_opencv):
+    renderer = ui.OverlayRenderer()
+    fake_opencv.queue_key(ord("+"))
+    assert renderer.should_quit() is False
+    assert renderer._zoom_level == pytest.approx(1.25)
+
+
+def test_zoom_out_key_decreases_zoom(fake_opencv):
+    renderer = ui.OverlayRenderer()
+    fake_opencv.queue_key(ord("-"))
+    assert renderer.should_quit() is False
+    assert renderer._zoom_level == pytest.approx(0.8)
+
+
+def test_zoom_equals_and_underscore_also_work(fake_opencv):
+    renderer = ui.OverlayRenderer()
+    fake_opencv.queue_key(ord("="))
+    renderer.should_quit()
+    fake_opencv.queue_key(ord("_"))
+    renderer.should_quit()
+    assert renderer._zoom_level == pytest.approx(1.0)
+
+
+def test_zoom_reset_key_returns_to_one(fake_opencv):
+    renderer = ui.OverlayRenderer()
+    renderer._zoom_level = 2.0
+    fake_opencv.queue_key(ord("0"))
+    assert renderer.should_quit() is False
+    assert renderer._zoom_level == pytest.approx(1.0)
+
+
+def test_zoom_respects_maximum_limit(fake_opencv):
+    renderer = ui.OverlayRenderer()
+    renderer._zoom_level = ui.OverlayRenderer.MAX_ZOOM
+    fake_opencv.queue_key(ord("+"))
+    assert renderer.should_quit() is False
+    assert renderer._zoom_level == pytest.approx(ui.OverlayRenderer.MAX_ZOOM)
+
+
+def test_zoom_respects_minimum_limit(fake_opencv):
+    renderer = ui.OverlayRenderer()
+    renderer._zoom_level = ui.OverlayRenderer.MIN_ZOOM
+    fake_opencv.queue_key(ord("-"))
+    assert renderer.should_quit() is False
+    assert renderer._zoom_level == pytest.approx(ui.OverlayRenderer.MIN_ZOOM)
+
+
+def test_show_applies_zoom_crop_and_resize(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    renderer._zoom_level = 2.0
+    renderer._window_created = True
+
+    resize_calls: list[tuple[int, int]] = []
+
+    def fake_resize(src, dsize, dst=None, fx=None, fy=None, interpolation=None):
+        resize_calls.append(dsize)
+        return np.zeros((dsize[1], dsize[0], 3), dtype=np.uint8)
+
+    fake_opencv.resize = fake_resize
+    renderer.show(blank_frame)
+
+    assert resize_calls == [(640, 480)]
+
+
+def test_show_letterboxes_when_zoomed_out(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    renderer._zoom_level = 0.5
+    renderer._window_created = True
+
+    resize_calls: list[tuple[int, int]] = []
+
+    def fake_resize(src, dsize, dst=None, fx=None, fy=None, interpolation=None):
+        resize_calls.append(dsize)
+        return np.zeros((dsize[1], dsize[0], 3), dtype=np.uint8)
+
+    fake_opencv.resize = fake_resize
+    renderer.show(blank_frame)
+
+    assert (320, 240) in resize_calls
+
+
+def test_show_keeps_original_shape_at_default_zoom(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    renderer._window_created = True
+    renderer.show(blank_frame)
+    assert blank_frame.shape == (480, 640, 3)
 
 
 # ---------------------------------------------------------------------------
