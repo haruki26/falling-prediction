@@ -6,9 +6,16 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import IntEnum
-from math import hypot
+from math import atan2, degrees, hypot
 
 import numpy as np
+
+
+# This is an image-plane orientation heuristic, not a measurement of physical
+# elevation; its meaning depends on the camera's orientation.  In normalized
+# image coordinates, a torso within 35 degrees of the image vertical is raised.
+UPPER_BODY_RAISED_MAX_ANGLE_DEGREES = 35.0
+MIN_TORSO_LENGTH = 0.08
 
 
 class RiskLevel(IntEnum):
@@ -163,11 +170,19 @@ class RiskEvaluator:
             reasons.append("head or hip near bed edge")
         shoulders = xy[[5, 6]]
         hips = xy[[11, 12]]
-        upright = (
-            np.isfinite(shoulders).all()
-            and np.isfinite(hips).all()
-            and np.nanmean(shoulders[:, 1]) < np.nanmean(hips[:, 1]) - 0.08
-        )
+        upright = False
+        if np.isfinite(shoulders).all() and np.isfinite(hips).all():
+            shoulder_midpoint = np.mean(shoulders, axis=0)
+            hip_midpoint = np.mean(hips, axis=0)
+            torso_vector = hip_midpoint - shoulder_midpoint
+            torso_length = float(np.linalg.norm(torso_vector))
+            if torso_length >= MIN_TORSO_LENGTH:
+                # atan2(dx, dy) measures signed deviation from image vertical;
+                # use its absolute value because lean direction is irrelevant.
+                torso_angle_degrees = abs(
+                    degrees(atan2(float(torso_vector[0]), float(torso_vector[1])))
+                )
+                upright = torso_angle_degrees <= UPPER_BODY_RAISED_MAX_ANGLE_DEGREES
         if upright:
             score += 1
             reasons.append("upper body raised")
