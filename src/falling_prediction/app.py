@@ -7,8 +7,7 @@ import time
 import cv2
 import numpy as np
 
-from .calibration import DEFAULT_DESTINATION_RECT, DEFAULT_OUTPUT_SIZE, PerspectiveCalibration, load_calibration, save_calibration
-from .config import AppConfig, ConfigurationError
+from .config import AppConfig, load_bed_region, save_bed_region
 from .openvino_pose import PoseEstimator
 from .pose_decoder import decode_poses
 from .risk import BedRegion, RiskEvaluator
@@ -32,57 +31,52 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
         raise RuntimeError(f"could not open camera {config.camera_index}")
     renderer = renderer or OverlayRenderer()
     try:
-        explicit = (config.bed_left, config.bed_top, config.bed_right, config.bed_bottom)
-        if any(value is not None for value in explicit):
-            raise ConfigurationError("explicit rectangular bed overrides are deprecated; use v2 perspective calibration")
-        # A forced calibration must work even when the existing file is a
-        # legacy v1 rectangle that cannot be rectified.
-        calibration = None if config.calibrate else load_calibration(config.calibration_file)
-        pending_frame = None
-        if calibration is None or config.calibrate:
-            observed_shape = None
-
-            def calibration_read():
-                nonlocal observed_shape
-                result = cap.read()
-                if result[0] and result[1] is not None:
-                    observed_shape = result[1].shape[:2][::-1]
-                return result
-
-            selected = renderer.calibrate_bed_live(calibration_read, initial_region=None)
-            if selected is None:
-                print("Bed calibration cancelled; exiting.")
-                return
-            if observed_shape is None:
-                # Test doubles and alternate UIs may not read during calibration.
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if hasattr(cap, "get") else 0
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if hasattr(cap, "get") else 0
-                if width <= 0 or height <= 0:
-                    ok, pending_frame = cap.read()
-                    if not ok:
-                        raise ConfigurationError("calibration did not provide a source frame")
-                    observed_shape = pending_frame.shape[:2][::-1]
-                else:
-                    observed_shape = (width, height)
-            calibration = PerspectiveCalibration(tuple(selected.points), observed_shape[0], observed_shape[1], *DEFAULT_OUTPUT_SIZE, DEFAULT_DESTINATION_RECT)
-            save_calibration(config.calibration_file, calibration)
-        evaluator = RiskEvaluator(calibration.bed_region)
+        explicit = (
+            config.bed_left,
+            config.bed_top,
+            config.bed_right,
+            config.bed_bottom,
+        )
+        if all(value is not None for value in explicit):
+            assert all(value is not None for value in explicit)
+            region_values = tuple(float(value) for value in explicit)  # type: ignore[arg-type]
+        else:
+            saved = load_bed_region(config.calibration_file)
+            if saved is None or config.calibrate:
+                initial = (
+                    BedBoundary(
+                        points=[
+                            (saved[0], saved[1]),
+                            (saved[2], saved[1]),
+                            (saved[2], saved[3]),
+                            (saved[0], saved[3]),
+                        ]
+                    )
+                    if saved is not None
+                    else None
+                )
+                selected = renderer.calibrate_bed_live(cap.read, initial_region=initial)
+                if selected is None:
+                    print("Bed calibration cancelled; exiting.")
+                    return
+                xs = [point[0] for point in selected.points]
+                ys = [point[1] for point in selected.points]
+                region_values = (min(xs), min(ys), max(xs), max(ys))
+                save_bed_region(config.calibration_file, region_values)
+            else:
+                region_values = saved
+        evaluator = RiskEvaluator(BedRegion(*region_values))
         if estimator is None:
             if config.model_path is None:
                 raise ValueError("model path is required")
             estimator = PoseEstimator(config.model_path, config.device)
         previous = time.perf_counter()
         while True:
-            if pending_frame is not None:
-                ok, frame = True, pending_frame
-                pending_frame = None
-            else:
-                ok, frame = cap.read()
+            ok, frame = cap.read()
             if not ok:
                 break
             started = time.perf_counter()
-            corrected = calibration.rectify(frame)
-            pafs, heatmaps = estimator.infer(corrected)
+            pafs, heatmaps = estimator.infer(frame)
             poses, scores = decode_poses(pafs, heatmaps)
             people = [
                 PersonSkeleton(
@@ -94,15 +88,15 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
                 )
                 for p in poses
             ]
-            def in_bed(p: np.ndarray) -> bool:
-                torso = p[[5, 6, 11, 12], :2]
-                torso_center = (float(np.mean(torso[:, 0])), float(np.mean(torso[:, 1])))
-                return bool(
-                    np.isfinite(torso_center[0])
-                    and np.isfinite(torso_center[1])
-                    and evaluator.bed.left <= torso_center[0] <= evaluator.bed.right
-                    and evaluator.bed.top <= torso_center[1] <= evaluator.bed.bottom
-                )
+            in_bed = lambda p: (
+                np.isfinite(p[[5, 6, 11, 12], :2]).all()
+                and evaluator.bed.left
+                <= np.mean(p[[5, 6, 11, 12], 0])
+                <= evaluator.bed.right
+                and evaluator.bed.top
+                <= np.mean(p[[5, 6, 11, 12], 1])
+                <= evaluator.bed.bottom
+            )
             selected = (
                 next((i for i in np.argsort(scores)[::-1] if in_bed(poses[i])), None)
                 if len(poses)
@@ -123,7 +117,7 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
                 else RiskStatus("waiting")
             )
             output = renderer.render(
-                corrected,
+                frame,
                 Telemetry(
                     fps=1 / max(elapsed, 1e-6),
                     device=config.device,

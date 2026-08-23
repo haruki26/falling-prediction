@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"--bed-{name}",
             dest=f"bed_{name}",
             type=float,
-            help=f"deprecated rectangular override {name}; use perspective calibration",
+            help=f"normalized bed rectangle {name} (default from 0.10/0.90)",
         )
     parser.add_argument("--calibrate", action="store_true", help="force interactive bed calibration")
     parser.add_argument("--calibration-file", type=Path, default=Path("bed_roi.json"),
@@ -90,8 +90,6 @@ def validate_config(
     bed_values = (config.bed_left, config.bed_top, config.bed_right, config.bed_bottom)
     if any(value is not None for value in bed_values) and not all(value is not None for value in bed_values):
         raise ConfigurationError("all four bed overrides must be supplied together")
-    if all(value is not None for value in bed_values):
-        raise ConfigurationError("--bed-left/top/right/bottom are deprecated: use --calibrate and a v2 perspective calibration")
     if all(value is not None for value in bed_values):
         left, top, right, bottom = bed_values
         assert left is not None and top is not None and right is not None and bottom is not None
@@ -130,11 +128,29 @@ def validate_config(
 
 
 def load_bed_region(path: Path) -> tuple[float, float, float, float] | None:
-    """Compatibility reader; v1 files are rejected, never converted silently."""
-    from .calibration import load_calibration
-    calibration = load_calibration(path)
-    return None if calibration is None else calibration.destination_bed_rect
+    """Load a versioned normalized ROI, rejecting malformed files explicitly."""
+    import json
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") != 1:
+            raise ValueError("unsupported version")
+        values = tuple(float(data[name]) for name in ("left", "top", "right", "bottom"))
+        if not all(__import__("math").isfinite(value) for value in values):
+            raise ValueError("coordinates must be finite")
+        left, top, right, bottom = values
+        if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+            raise ValueError("coordinates must form a normalized rectangle")
+        return (values[0], values[1], values[2], values[3])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"invalid calibration file {path}: {exc}") from exc
 
 
 def save_bed_region(path: Path, region: tuple[float, float, float, float]) -> None:
-    raise ConfigurationError("v1 rectangular calibration persistence is deprecated; save a v2 perspective calibration")
+    import json
+    left, top, right, bottom = region
+    if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+        raise ConfigurationError("cannot save invalid normalized bed rectangle")
+    path.write_text(json.dumps({"version": 1, "left": left, "top": top,
+                                "right": right, "bottom": bottom}, indent=2) + "\n", encoding="utf-8")
