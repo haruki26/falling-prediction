@@ -150,8 +150,9 @@ DEFAULT_REASON_TRANSLATIONS: dict[str, str] = {
 }
 
 # ASCII-safe calibration instructions (OpenCV Hershey fonts).
+# Click order is top-left -> top-right -> bottom-right -> bottom-left.
 _CALIB_INSTRUCTIONS = (
-    "CLICK 4 BED CORNERS",
+    "CLICK 4 BED CORNERS: TOP-L -> TOP-R -> BOTTOM-R -> BOTTOM-L",
     "ENTER/SPACE CONFIRM   R RESET   ESC CANCEL",
 )
 
@@ -233,10 +234,10 @@ class OverlayRenderer:
         """Convert a core ``BedRegion`` into a renderable polygon."""
         return BedBoundary(
             points=[
-                (region.left, region.top),
-                (region.right, region.top),
-                (region.right, region.bottom),
-                (region.left, region.bottom),
+                (region.left, region.top),      # top-left
+                (region.right, region.top),     # top-right
+                (region.right, region.bottom),  # bottom-right
+                (region.left, region.bottom),   # bottom-left
             ],
             label=DEFAULT_LABELS["bed"],
         )
@@ -315,10 +316,11 @@ class OverlayRenderer:
     ) -> BedBoundary | None:
         """Run an interactive bed ROI calibration on a frozen camera frame.
 
-        The frame is shown in a dedicated window.  The user left-clicks four
-        corner points in the desired order to define the bed region.  Collected
-        points and the in-progress polygon are overlaid on the frame, and
-        ASCII-safe instructions are drawn at the bottom of the window.
+        The frame is shown in a dedicated window.  The user left-clicks the
+        four bed corners in order: top-left, top-right, bottom-right, then
+        bottom-left.  Collected points and the in-progress polygon are overlaid
+        on the frame, and ASCII-safe instructions are drawn at the bottom of
+        the window.
 
         Keys
         ----
@@ -398,11 +400,11 @@ class OverlayRenderer:
         """Run interactive bed ROI calibration on a live camera feed.
 
         Frames are continuously read via ``read_frame`` and shown in a dedicated
-        calibration window.  The user left-clicks four corner points in the
-        desired order to define the bed region; collected points and the
-        in-progress polygon are overlaid on each new frame.  Temporary read
-        failures are handled gracefully: the last good frame is kept until a
-        new one arrives.
+        calibration window.  The user left-clicks the four bed corners in
+        order: top-left, top-right, bottom-right, then bottom-left.  Collected
+        points and the in-progress polygon are overlaid on each new frame.
+        Temporary read failures are handled gracefully: the last good frame is
+        kept until a new one arrives.
 
         Keys
         ----
@@ -891,9 +893,10 @@ class OverlayRenderer:
     ) -> None:
         """Mouse callback for the bed calibration window.
 
-        Each left click appends a corner point.  A fifth click (or any click
-        after four points have been collected) starts a fresh selection so the
-        user can quickly redo the polygon.
+        Each left click appends a corner point in the required order:
+        top-left, top-right, bottom-right, then bottom-left.  A fifth click
+        (or any click after four points have been collected) starts a fresh
+        selection so the user can quickly redo the polygon.
         """
         if event == cv2.EVENT_LBUTTONDOWN:
             if len(self._calib_points) >= 4:

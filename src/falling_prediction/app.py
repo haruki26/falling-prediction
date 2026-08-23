@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from .config import AppConfig, load_bed_region, save_bed_region
+from .homography import compute_homography, transform_poses
 from .openvino_pose import PoseEstimator
 from .pose_decoder import decode_poses
 from .risk import BedRegion, RiskEvaluator
@@ -23,7 +24,7 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
         explicit = (config.bed_left, config.bed_top, config.bed_right, config.bed_bottom)
         if all(value is not None for value in explicit):
             assert all(value is not None for value in explicit)
-            bed = BedRegion(*tuple(float(value) for value in explicit))  # type: ignore[arg-type]
+            display_bed = BedRegion(*tuple(float(value) for value in explicit))  # type: ignore[arg-type]
         else:
             saved = load_bed_region(config.calibration_file)
             if saved is None or config.calibrate:
@@ -35,11 +36,12 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
                 if selected is None:
                     print("Bed calibration cancelled; exiting.")
                     return
-                bed = BedRegion(points=selected.points)
-                save_bed_region(config.calibration_file, bed.points)
+                display_bed = BedRegion(points=selected.points)
+                save_bed_region(config.calibration_file, display_bed.points)
             else:
-                bed = BedRegion(points=saved)
-        evaluator = RiskEvaluator(bed)
+                display_bed = BedRegion(points=saved)
+        homography = compute_homography(display_bed.points)
+        evaluator = RiskEvaluator(BedRegion(points=((0, 0), (1, 0), (1, 1), (0, 1))))
         if estimator is None:
             if config.model_path is None:
                 raise ValueError("model path is required")
@@ -51,6 +53,7 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
             started = time.perf_counter()
             pafs, heatmaps = estimator.infer(frame)
             poses, scores = decode_poses(pafs, heatmaps)
+            projected_poses = transform_poses(poses, homography)
             people = [
                 PersonSkeleton(
                     [
@@ -66,14 +69,14 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
                 and evaluator.bed.contains(np.mean(p[[5, 6, 11, 12], :2], axis=0))
             )
             selected = (
-                next((i for i in np.argsort(scores)[::-1] if in_bed(poses[i])), None)
+                next((i for i in np.argsort(scores)[::-1] if in_bed(projected_poses[i])), None)
                 if len(poses)
                 else None
             )
             if selected is None and len(poses):
                 selected = int(np.argmax(scores))
             result = (
-                evaluator.evaluate(poses[selected])
+                evaluator.evaluate(projected_poses[selected])
                 if selected is not None
                 else evaluator.evaluate(np.full((17, 3), np.nan))
             )
@@ -94,7 +97,7 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
                 ),
                 risk=risk,
                 persons=people,
-                bed_boundary=renderer.from_bed_region(evaluator.bed),
+                bed_boundary=renderer.from_bed_region(display_bed),
             )
             renderer.show(output)
             if renderer.should_quit():
