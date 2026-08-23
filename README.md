@@ -11,10 +11,11 @@ uv run falling-prediction --model models/human-pose-estimation-0001/human-pose-e
 ```
 
 On first startup the app opens the camera and calibrates the bed, saving a
-versioned normalized rectangle to `./bed_roi.json`. Use
+versioned normalized four-point polygon to `./bed_roi.json`. Use
 `--calibration-file PATH` to choose another file, or `--calibrate` to force a
-new calibration. Drag with the left mouse button, then press **Enter** or
+new calibration. Click the four bed corners in order, then press **Enter** or
 **Space** to confirm; press **R** to reset or **Esc** to cancel and exit.
+Clicking again after four corners starts a new selection.
 Use `--bed-left`, `--bed-top`, `--bed-right`, and `--bed-bottom` together as
 explicit normalized rectangular-bed overrides; these skip calibration.
 Press **Esc** in the monitoring window to stop. Model XML/BIN files are not committed.

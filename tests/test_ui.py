@@ -333,21 +333,19 @@ def test_calibrate_bed_rejects_invalid_frame():
 
 def test_calibrate_bed_returns_selection_on_confirm(blank_frame, fake_opencv):
     renderer = ui.OverlayRenderer()
-    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, 100, 100, 0)
-    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_MOUSEMOVE, 300, 250, 0)
-    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONUP, 300, 250, 0)
+    # Four left clicks define the bed corners in click order.
+    corners = [(100, 100), (300, 80), (320, 250), (80, 240)]
+    for x, y in corners:
+        fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, x, y, 0)
     fake_opencv.queue_key(13)  # Enter
 
     result = renderer.calibrate_bed(blank_frame, window_name=CALIB_WIN)
 
     assert result is not None
-    xs = [p[0] for p in result.points]
-    ys = [p[1] for p in result.points]
-    assert min(xs) == pytest.approx(100 / 640, abs=1e-6)
-    assert max(xs) == pytest.approx(300 / 640, abs=1e-6)
-    assert min(ys) == pytest.approx(100 / 480, abs=1e-6)
-    assert max(ys) == pytest.approx(250 / 480, abs=1e-6)
     assert result.label == "BED"
+    assert result.points == [
+        pytest.approx((x / 640, y / 480), abs=1e-6) for x, y in corners
+    ]
 
 
 def test_calibrate_bed_returns_none_on_cancel(blank_frame, fake_opencv):
@@ -394,9 +392,9 @@ def test_calibrate_bed_reset_restores_initial_region(blank_frame, fake_opencv):
     initial = ui.BedBoundary(
         points=[(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)]
     )
-    # Drag a different region, reset, then confirm.
-    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, 10, 10, 0)
-    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONUP, 50, 50, 0)
+    # Click a different region, reset, then confirm.
+    for x, y in [(10, 10), (50, 10), (50, 50), (10, 50)]:
+        fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, x, y, 0)
     fake_opencv.queue_key(ord("r"))
     fake_opencv.queue_key(13)
 
@@ -405,9 +403,12 @@ def test_calibrate_bed_reset_restores_initial_region(blank_frame, fake_opencv):
     )
 
     assert result is not None
-    xs = [p[0] for p in result.points]
-    assert min(xs) == pytest.approx(0.2)
-    assert max(xs) == pytest.approx(0.8)
+    assert result.points == [
+        pytest.approx((0.2, 0.2)),
+        pytest.approx((0.8, 0.2)),
+        pytest.approx((0.8, 0.8)),
+        pytest.approx((0.2, 0.8)),
+    ]
 
 
 def test_calibrate_bed_uses_custom_label(blank_frame, fake_opencv):
@@ -423,6 +424,41 @@ def test_calibrate_bed_uses_custom_label(blank_frame, fake_opencv):
 
     assert result is not None
     assert result.label == "MAT"
+
+
+def test_calibrate_bed_ignores_confirm_before_four_points(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    # Only two clicks: Enter should be ignored and calibration cancelled.
+    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, 100, 100, 0)
+    fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, 200, 200, 0)
+    fake_opencv.queue_key(13)  # Enter (ignored)
+    fake_opencv.queue_key(27)  # Esc to end the loop
+
+    result = renderer.calibrate_bed(blank_frame, window_name=CALIB_WIN)
+
+    assert result is None
+
+
+def test_calibrate_bed_fifth_click_starts_new_selection(blank_frame, fake_opencv):
+    renderer = ui.OverlayRenderer()
+    initial = [(100, 100), (300, 80), (320, 250), (80, 240)]
+    replacement = [(50, 50)]
+    for x, y in initial:
+        fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, x, y, 0)
+    for x, y in replacement:
+        fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, x, y, 0)
+    # Complete the new selection with three more corners.
+    for x, y in [(150, 50), (150, 150), (50, 150)]:
+        fake_opencv.queue_mouse(CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, x, y, 0)
+    fake_opencv.queue_key(13)
+
+    result = renderer.calibrate_bed(blank_frame, window_name=CALIB_WIN)
+
+    assert result is not None
+    expected = [(50, 50), (150, 50), (150, 150), (50, 150)]
+    assert result.points == [
+        pytest.approx((x / 640, y / 480), abs=1e-6) for x, y in expected
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -470,29 +506,26 @@ def test_calibrate_bed_live_renders_multiple_frames(blank_frame, fake_opencv):
     assert LIVE_CALIB_WIN not in fake_opencv._mouse_callbacks
 
 
-def test_calibrate_bed_live_confirms_dragged_roi(blank_frame, fake_opencv):
+def test_calibrate_bed_live_confirms_clicked_roi(blank_frame, fake_opencv):
     renderer = ui.OverlayRenderer()
 
     def read_frame() -> tuple[bool, np.ndarray]:
         return True, blank_frame
 
-    # Let a couple of live frames render, then drag a ROI and confirm.
+    # Let a couple of live frames render, then click four corners and confirm.
     fake_opencv.queue_key(0)
     fake_opencv.queue_key(0)
-    fake_opencv.queue_mouse(LIVE_CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, 100, 100, 0)
-    fake_opencv.queue_mouse(LIVE_CALIB_WIN, fake_opencv.EVENT_MOUSEMOVE, 300, 250, 0)
-    fake_opencv.queue_mouse(LIVE_CALIB_WIN, fake_opencv.EVENT_LBUTTONUP, 300, 250, 0)
+    corners = [(100, 100), (300, 80), (320, 250), (80, 240)]
+    for x, y in corners:
+        fake_opencv.queue_mouse(LIVE_CALIB_WIN, fake_opencv.EVENT_LBUTTONDOWN, x, y, 0)
     fake_opencv.queue_key(13)
 
     result = renderer.calibrate_bed_live(read_frame, window_name=LIVE_CALIB_WIN)
 
     assert result is not None
-    xs = [p[0] for p in result.points]
-    ys = [p[1] for p in result.points]
-    assert min(xs) == pytest.approx(100 / 640, abs=1e-6)
-    assert max(xs) == pytest.approx(300 / 640, abs=1e-6)
-    assert min(ys) == pytest.approx(100 / 480, abs=1e-6)
-    assert max(ys) == pytest.approx(250 / 480, abs=1e-6)
+    assert result.points == [
+        pytest.approx((x / 640, y / 480), abs=1e-6) for x, y in corners
+    ]
 
 
 def test_calibrate_bed_live_handles_temporary_read_failure(blank_frame, fake_opencv):

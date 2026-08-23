@@ -6,6 +6,10 @@ import argparse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeAlias
+
+
+BedPoints: TypeAlias = tuple[tuple[float, float], ...]
 
 
 class ConfigurationError(ValueError):
@@ -127,30 +131,47 @@ def validate_config(
     return config
 
 
-def load_bed_region(path: Path) -> tuple[float, float, float, float] | None:
-    """Load a versioned normalized ROI, rejecting malformed files explicitly."""
+def load_bed_region(path: Path) -> BedPoints | None:
+    """Load a versioned normalized four-point ROI.
+
+    Version 1 rectangle files are upgraded in memory to polygon points.
+    """
     import json
     if not path.exists():
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("version") != 1:
+        version = data.get("version")
+        if version == 1:
+            left, top, right, bottom = (float(data[name]) for name in ("left", "top", "right", "bottom"))
+            points = ((left, top), (right, top), (right, bottom), (left, bottom))
+        elif version == 2:
+            points = tuple((float(point[0]), float(point[1])) for point in data["points"])
+        else:
             raise ValueError("unsupported version")
-        values = tuple(float(data[name]) for name in ("left", "top", "right", "bottom"))
-        if not all(__import__("math").isfinite(value) for value in values):
-            raise ValueError("coordinates must be finite")
-        left, top, right, bottom = values
-        if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
-            raise ValueError("coordinates must form a normalized rectangle")
-        return (values[0], values[1], values[2], values[3])
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        from .risk import BedRegion
+        return BedRegion(points=points).points
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
         raise ConfigurationError(f"invalid calibration file {path}: {exc}") from exc
 
 
-def save_bed_region(path: Path, region: tuple[float, float, float, float]) -> None:
+def save_bed_region(path: Path, region) -> None:
+    """Save a normalized four-point polygon as version 2 JSON.
+
+    A four-number rectangle is accepted for callers using the old API.
+    """
     import json
-    left, top, right, bottom = region
-    if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
-        raise ConfigurationError("cannot save invalid normalized bed rectangle")
-    path.write_text(json.dumps({"version": 1, "left": left, "top": top,
-                                "right": right, "bottom": bottom}, indent=2) + "\n", encoding="utf-8")
+    try:
+        if hasattr(region, "points"):
+            points = region.points
+        elif len(region) == 4 and all(not hasattr(p, "__len__") for p in region):
+            left, top, right, bottom = (float(v) for v in region)
+            points = ((left, top), (right, top), (right, bottom), (left, bottom))
+        else:
+            points = region
+        from .risk import BedRegion
+        points = BedRegion(points=points).points
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ConfigurationError(f"cannot save invalid normalized bed polygon: {exc}") from exc
+    path.write_text(json.dumps({"version": 2, "points": [list(p) for p in points],
+                                }, indent=2) + "\n", encoding="utf-8")

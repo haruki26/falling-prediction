@@ -151,7 +151,7 @@ DEFAULT_REASON_TRANSLATIONS: dict[str, str] = {
 
 # ASCII-safe calibration instructions (OpenCV Hershey fonts).
 _CALIB_INSTRUCTIONS = (
-    "DRAG TO SELECT",
+    "CLICK 4 BED CORNERS",
     "ENTER/SPACE CONFIRM   R RESET   ESC CANCEL",
 )
 
@@ -315,15 +315,16 @@ class OverlayRenderer:
     ) -> BedBoundary | None:
         """Run an interactive bed ROI calibration on a frozen camera frame.
 
-        The frame is shown in a dedicated window.  The user drags the left
-        mouse button to draw or adjust a rectangular bed region.  The current
-        selection is shaded and outlined, and ASCII-safe instructions are
-        drawn at the bottom of the window.
+        The frame is shown in a dedicated window.  The user left-clicks four
+        corner points in the desired order to define the bed region.  Collected
+        points and the in-progress polygon are overlaid on the frame, and
+        ASCII-safe instructions are drawn at the bottom of the window.
 
         Keys
         ----
         Enter / Space
-            Confirm the current selection and close the window.
+            Confirm the four-point selection and close the window.  This only
+            works once four corners have been clicked.
         R / r
             Reset the selection to ``initial_region`` (or clear it if none).
         Esc
@@ -342,7 +343,7 @@ class OverlayRenderer:
         Returns
         -------
         BedBoundary | None
-            Normalized rectangular boundary, or ``None`` if cancelled.
+            Normalized four-point boundary, or ``None`` if cancelled.
         """
         if frame.ndim != 3 or frame.shape[2] != 3:
             raise ValueError("frame must be a 3-channel BGR image")
@@ -366,7 +367,7 @@ class OverlayRenderer:
                 if key == 27:  # Esc
                     self._calib_cancelled = True
                 elif key in (13, 32):  # Enter / Space
-                    if self._calib_selection is not None:
+                    if len(self._calib_points) == 4:
                         self._calib_confirmed = True
                 elif key in (ord("r"), ord("R")):
                     self._reset_calib_selection(frame.shape, initial_region)
@@ -374,24 +375,15 @@ class OverlayRenderer:
             cv2.setMouseCallback(win, lambda *args, **kwargs: None)
             cv2.destroyWindow(win)
 
-        if self._calib_cancelled or self._calib_selection is None:
+        if self._calib_cancelled or len(self._calib_points) < 4:
             return None
 
-        selection = self._calib_selection
-        (x1, y1), (x2, y2) = selection
-        x1, x2 = sorted(
-            [max(0, min(width, x1)) / width, max(0, min(width, x2)) / width]
-        )
-        y1, y2 = sorted(
-            [max(0, min(height, y1)) / height, max(0, min(height, y2)) / height]
-        )
+        points = [
+            (max(0, min(width, x)) / width, max(0, min(height, y)) / height)
+            for x, y in self._calib_points[:4]
+        ]
         return BedBoundary(
-            points=[
-                (x1, y1),
-                (x2, y1),
-                (x2, y2),
-                (x1, y2),
-            ],
+            points=points,
             label=self.labels.get("bed", "BED"),
         )
 
@@ -406,14 +398,17 @@ class OverlayRenderer:
         """Run interactive bed ROI calibration on a live camera feed.
 
         Frames are continuously read via ``read_frame`` and shown in a dedicated
-        calibration window.  The in-progress ROI is overlaid on each new frame
-        while the user drags.  Temporary read failures are handled gracefully:
-        the last good frame is kept until a new one arrives.
+        calibration window.  The user left-clicks four corner points in the
+        desired order to define the bed region; collected points and the
+        in-progress polygon are overlaid on each new frame.  Temporary read
+        failures are handled gracefully: the last good frame is kept until a
+        new one arrives.
 
         Keys
         ----
         Enter / Space
-            Confirm the current selection and close the window.
+            Confirm the four-point selection and close the window.  This only
+            works once four corners have been clicked.
         R / r
             Reset the selection to ``initial_region`` (or clear it if none).
         Esc
@@ -436,7 +431,7 @@ class OverlayRenderer:
         Returns
         -------
         BedBoundary | None
-            Normalized rectangular boundary confirmed by the user, or ``None``
+            Normalized four-point boundary confirmed by the user, or ``None``
             if cancelled or no valid frame was ever available to normalize
             against.  The caller can retain the latest valid frame by calling
             ``read_frame`` after calibration returns.
@@ -492,7 +487,7 @@ class OverlayRenderer:
                 if key == 27:  # Esc
                     self._calib_cancelled = True
                 elif key in (13, 32):  # Enter / Space
-                    if self._calib_selection is not None and have_valid_frame:
+                    if len(self._calib_points) == 4 and have_valid_frame:
                         self._calib_confirmed = True
                 elif key in (ord("r"), ord("R")):
                     if have_valid_frame and self._calib_current_frame is not None:
@@ -508,28 +503,19 @@ class OverlayRenderer:
 
         if (
             self._calib_cancelled
-            or self._calib_selection is None
+            or len(self._calib_points) < 4
             or not have_valid_frame
             or last_valid_shape is None
         ):
             return None
 
         height, width = last_valid_shape[:2]
-        selection = self._calib_selection
-        (x1, y1), (x2, y2) = selection
-        x1, x2 = sorted(
-            [max(0, min(width, x1)) / width, max(0, min(width, x2)) / width]
-        )
-        y1, y2 = sorted(
-            [max(0, min(height, y1)) / height, max(0, min(height, y2)) / height]
-        )
+        points = [
+            (max(0, min(width, x)) / width, max(0, min(height, y)) / height)
+            for x, y in self._calib_points[:4]
+        ]
         return BedBoundary(
-            points=[
-                (x1, y1),
-                (x2, y1),
-                (x2, y2),
-                (x1, y2),
-            ],
+            points=points,
             label=self.labels.get("bed", "BED"),
         )
 
@@ -903,19 +889,17 @@ class OverlayRenderer:
     def _on_calib_mouse(
         self, event: int, x: int, y: int, flags: int, param: Any
     ) -> None:
-        """Mouse callback for the bed calibration window."""
+        """Mouse callback for the bed calibration window.
+
+        Each left click appends a corner point.  A fifth click (or any click
+        after four points have been collected) starts a fresh selection so the
+        user can quickly redo the polygon.
+        """
         if event == cv2.EVENT_LBUTTONDOWN:
-            self._calib_start = (x, y)
-            self._calib_end = (x, y)
-            self._calib_drawing = True
-            self._calib_selection = (self._calib_start, self._calib_end)
-        elif event == cv2.EVENT_MOUSEMOVE and self._calib_drawing:
-            self._calib_end = (x, y)
-            self._calib_selection = (self._calib_start, self._calib_end)
-        elif event == cv2.EVENT_LBUTTONUP:
-            self._calib_drawing = False
-            self._calib_end = (x, y)
-            self._calib_selection = (self._calib_start, self._calib_end)
+            if len(self._calib_points) >= 4:
+                self._calib_points = [(x, y)]
+            else:
+                self._calib_points.append((x, y))
 
     def _reset_calib_selection(
         self,
@@ -925,40 +909,61 @@ class OverlayRenderer:
         """Reset the calibration selection to ``initial_region`` or clear it."""
         height, width = frame_shape[:2]
         if initial_region is not None:
-            xs = [p[0] for p in initial_region.points]
-            ys = [p[1] for p in initial_region.points]
-            x1 = int(min(xs) * width)
-            x2 = int(max(xs) * width)
-            y1 = int(min(ys) * height)
-            y2 = int(max(ys) * height)
-            self._calib_start = (x1, y1)
-            self._calib_end = (x2, y2)
-            self._calib_selection = ((x1, y1), (x2, y2))
+            self._calib_points = [
+                (int(p[0] * width), int(p[1] * height))
+                for p in initial_region.points
+                if math.isfinite(p[0]) and math.isfinite(p[1])
+            ]
         else:
-            self._calib_start = None
-            self._calib_end = None
-            self._calib_selection = None
-        self._calib_drawing = False
+            self._calib_points = []
 
     def _draw_calibration_overlay(
         self, frame: np.ndarray, width: int, height: int
     ) -> np.ndarray:
-        """Return a copy of ``frame`` with the current selection and instructions."""
+        """Return a copy of ``frame`` with the current points and instructions."""
         display = frame.copy()
 
-        if self._calib_selection is not None:
-            (x1, y1), (x2, y2) = self._calib_selection
-            x1, x2 = sorted([max(0, min(width, x1)), max(0, min(width, x2))])
-            y1, y2 = sorted([max(0, min(height, y1)), max(0, min(height, y2))])
+        points = self._calib_points
+        if points:
+            pts = np.array(points, dtype=np.int32)
+            pts = np.clip(pts, 0, [width - 1, height - 1])
 
-            if x2 > x1 and y2 > y1:
+            # Draw collected corner points.
+            for x, y in pts:
+                cv2.circle(
+                    display, (int(x), int(y)), 6, PALETTE["bed"], -1, cv2.LINE_AA
+                )
+                cv2.circle(
+                    display, (int(x), int(y)), 6, (255, 255, 255), 1, cv2.LINE_AA
+                )
+
+            # Draw polygon preview in click order.
+            if len(pts) >= 2:
+                for i in range(len(pts) - 1):
+                    self._draw_dashed_line(
+                        display,
+                        tuple(pts[i]),
+                        tuple(pts[i + 1]),
+                        PALETTE["bed"],
+                        2,
+                        dash_len=12,
+                    )
+
+            if len(pts) == 4:
+                # Close the polygon and shade the interior once four corners
+                # have been collected.
+                self._draw_dashed_line(
+                    display,
+                    tuple(pts[-1]),
+                    tuple(pts[0]),
+                    PALETTE["bed"],
+                    2,
+                    dash_len=12,
+                )
                 overlay = display.copy()
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), PALETTE["bed_glow"], -1)
+                cv2.fillPoly(overlay, [pts], PALETTE["bed_glow"])
                 cv2.addWeighted(
                     overlay, self.panel_alpha, display, 1 - self.panel_alpha, 0, display
-                )
-                cv2.rectangle(
-                    display, (x1, y1), (x2, y2), PALETTE["bed"], 2, cv2.LINE_AA
                 )
 
         self._draw_instruction_strip(display)

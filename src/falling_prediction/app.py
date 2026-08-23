@@ -23,26 +23,23 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
         explicit = (config.bed_left, config.bed_top, config.bed_right, config.bed_bottom)
         if all(value is not None for value in explicit):
             assert all(value is not None for value in explicit)
-            region_values = tuple(float(value) for value in explicit)  # type: ignore[arg-type]
+            bed = BedRegion(*tuple(float(value) for value in explicit))  # type: ignore[arg-type]
         else:
             saved = load_bed_region(config.calibration_file)
             if saved is None or config.calibrate:
                 initial = (
-                    BedBoundary(points=[(saved[0], saved[1]), (saved[2], saved[1]),
-                                         (saved[2], saved[3]), (saved[0], saved[3])])
+                    BedBoundary(points=list(saved))
                     if saved is not None else None
                 )
                 selected = renderer.calibrate_bed_live(cap.read, initial_region=initial)
                 if selected is None:
                     print("Bed calibration cancelled; exiting.")
                     return
-                xs = [point[0] for point in selected.points]
-                ys = [point[1] for point in selected.points]
-                region_values = (min(xs), min(ys), max(xs), max(ys))
-                save_bed_region(config.calibration_file, region_values)
+                bed = BedRegion(points=selected.points)
+                save_bed_region(config.calibration_file, bed.points)
             else:
-                region_values = saved
-        evaluator = RiskEvaluator(BedRegion(*region_values))
+                bed = BedRegion(points=saved)
+        evaluator = RiskEvaluator(bed)
         if estimator is None:
             if config.model_path is None:
                 raise ValueError("model path is required")
@@ -66,12 +63,7 @@ def run(config: AppConfig, *, capture=None, estimator=None, renderer=None) -> No
             ]
             in_bed = lambda p: (
                 np.isfinite(p[[5, 6, 11, 12], :2]).all()
-                and evaluator.bed.left
-                <= np.mean(p[[5, 6, 11, 12], 0])
-                <= evaluator.bed.right
-                and evaluator.bed.top
-                <= np.mean(p[[5, 6, 11, 12], 1])
-                <= evaluator.bed.bottom
+                and evaluator.bed.contains(np.mean(p[[5, 6, 11, 12], :2], axis=0))
             )
             selected = (
                 next((i for i in np.argsort(scores)[::-1] if in_bed(poses[i])), None)
