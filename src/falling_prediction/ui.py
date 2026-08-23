@@ -149,12 +149,6 @@ DEFAULT_REASON_TRANSLATIONS: dict[str, str] = {
     "rapid movement toward edge": "Rapid movement toward edge",
 }
 
-# ASCII-safe calibration instructions (OpenCV Hershey fonts).
-_CALIB_INSTRUCTIONS = (
-    "DRAG TO SELECT",
-    "ENTER/SPACE CONFIRM   R RESET   ESC CANCEL",
-)
-
 
 # ---------------------------------------------------------------------------
 # Renderer
@@ -182,12 +176,6 @@ class OverlayRenderer:
     ...     renderer.close()
     """
 
-    # Interactive display zoom.  The renderer composes the full-resolution
-    # frame and then crops/resizes around the center before showing it.
-    MIN_ZOOM: float = 0.5
-    MAX_ZOOM: float = 4.0
-    ZOOM_STEP: float = 1.25
-
     def __init__(
         self,
         window_name: str | None = None,
@@ -212,7 +200,6 @@ class OverlayRenderer:
         self.skeleton_confidence_threshold = skeleton_confidence_threshold
         self.show_bed_label = show_bed_label
         self._window_created = False
-        self._zoom_level: float = 1.0
 
     # -- Integration helpers ------------------------------------------------
 
@@ -282,35 +269,20 @@ class OverlayRenderer:
         return canvas
 
     def show(self, frame: np.ndarray) -> None:
-        """Display the frame using ``cv2.imshow`` (Windows-compatible).
-
-        The composed frame is cropped and resized around the center according
-        to the current interactive zoom level, then a small zoom indicator is
-        overlaid when zoomed away from 1.0x.
-        """
-        display = self._apply_zoom(frame)
-        self._draw_zoom_hint(display)
-        cv2.imshow(self.window_name, display)
+        """Display the frame using ``cv2.imshow`` (Windows-compatible)."""
+        cv2.imshow(self.window_name, frame)
         if not self._window_created:
             self._window_created = True
 
     def should_quit(self, timeout_ms: int = 1) -> bool:
         """Return True if the user pressed ESC or closed the window.
 
-        This method also reads the interactive zoom keys: ``+``/``=`` zooms
-        in, ``-``/``_`` zooms out, and ``0`` resets to 1.0x.  ``timeout_ms``
-        is passed to ``cv2.waitKey``.  Use a small value inside a realtime
-        loop.
+        ``timeout_ms`` is passed to ``cv2.waitKey``.  Use a small value inside a
+        realtime loop.
         """
         key = cv2.waitKey(timeout_ms) & 0xFF
         if key == 27:  # ESC
             return True
-        if key in (ord("+"), ord("=")):
-            self._zoom_level = min(self.MAX_ZOOM, self._zoom_level * self.ZOOM_STEP)
-        elif key in (ord("-"), ord("_")):
-            self._zoom_level = max(self.MIN_ZOOM, self._zoom_level / self.ZOOM_STEP)
-        elif key == ord("0"):
-            self._zoom_level = 1.0
         if self._window_created:
             try:
                 if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
@@ -335,19 +307,22 @@ class OverlayRenderer:
         *,
         window_name: str | None = None,
     ) -> BedBoundary | None:
-        """Run an interactive bed ROI calibration on a frozen camera frame.
+        """Run an interactive four-corner bed calibration on a frozen frame.
 
-        The frame is shown in a dedicated window.  The user drags the left
-        mouse button to draw or adjust a rectangular bed region.  The current
-        selection is shaded and outlined, and ASCII-safe instructions are
-        drawn at the bottom of the window.
+        The user clicks the four bed corners in order:
+        left-top, right-top, right-bottom, left-bottom.  Numbered markers and
+        connecting lines give immediate feedback, and the polygon is only
+        confirmable when it is convex and does not self-cross.
 
         Keys
         ----
         Enter / Space
-            Confirm the current selection and close the window.
+            Confirm the four selected corners and close the window.
+            Ignored until four valid corners are selected.
+        Backspace
+            Remove the most recently clicked corner.
         R / r
-            Reset the selection to ``initial_region`` (or clear it if none).
+            Reset to ``initial_region`` (or clear all corners if none).
         Esc
             Cancel and close the window.
 
@@ -356,7 +331,7 @@ class OverlayRenderer:
         frame
             3-channel BGR image to calibrate on.  It is not modified.
         initial_region
-            Optional starting bed boundary in normalized coordinates.
+            Optional starting boundary with four normalized corners in order.
         window_name
             Optional calibration window name.  Defaults to
             ``"{monitor_window} - Bed Calibration"``.
@@ -364,7 +339,8 @@ class OverlayRenderer:
         Returns
         -------
         BedBoundary | None
-            Normalized rectangular boundary, or ``None`` if cancelled.
+            Normalized quadrilateral with four ordered corners, or ``None`` if
+            cancelled.
         """
         if frame.ndim != 3 or frame.shape[2] != 3:
             raise ValueError("frame must be a 3-channel BGR image")
@@ -374,7 +350,11 @@ class OverlayRenderer:
 
         self._calib_cancelled = False
         self._calib_confirmed = False
-        self._reset_calib_selection(frame.shape, initial_region)
+        self._calib_points: list[tuple[float, float]] = []
+        self._calib_width = width
+        self._calib_height = height
+        self._calib_has_valid_frame = True
+        self._reset_calib_selection(initial_region)
 
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.imshow(win, self._draw_calibration_overlay(frame, width, height))
@@ -388,32 +368,24 @@ class OverlayRenderer:
                 if key == 27:  # Esc
                     self._calib_cancelled = True
                 elif key in (13, 32):  # Enter / Space
-                    if self._calib_selection is not None:
+                    if self._validate_calib_points(self._calib_points)[0]:
                         self._calib_confirmed = True
                 elif key in (ord("r"), ord("R")):
-                    self._reset_calib_selection(frame.shape, initial_region)
+                    self._reset_calib_selection(initial_region)
+                elif key in (8, 127):  # Backspace
+                    if self._calib_points:
+                        self._calib_points.pop()
         finally:
             cv2.setMouseCallback(win, lambda *args, **kwargs: None)
             cv2.destroyWindow(win)
 
-        if self._calib_cancelled or self._calib_selection is None:
+        if self._calib_cancelled or not self._validate_calib_points(
+            self._calib_points
+        )[0]:
             return None
 
-        selection = self._calib_selection
-        (x1, y1), (x2, y2) = selection
-        x1, x2 = sorted(
-            [max(0, min(width, x1)) / width, max(0, min(width, x2)) / width]
-        )
-        y1, y2 = sorted(
-            [max(0, min(height, y1)) / height, max(0, min(height, y2)) / height]
-        )
         return BedBoundary(
-            points=[
-                (x1, y1),
-                (x2, y1),
-                (x2, y2),
-                (x1, y2),
-            ],
+            points=[(float(p[0]), float(p[1])) for p in self._calib_points],
             label=self.labels.get("bed", "BED"),
         )
 
@@ -425,19 +397,23 @@ class OverlayRenderer:
         window_name: str | None = None,
         timeout_ms: int = 33,
     ) -> BedBoundary | None:
-        """Run interactive bed ROI calibration on a live camera feed.
+        """Run interactive four-corner bed calibration on a live camera feed.
 
         Frames are continuously read via ``read_frame`` and shown in a dedicated
-        calibration window.  The in-progress ROI is overlaid on each new frame
-        while the user drags.  Temporary read failures are handled gracefully:
-        the last good frame is kept until a new one arrives.
+        calibration window.  The in-progress quadrilateral is overlaid on each
+        new frame while the user clicks the four corners.  Temporary read
+        failures are handled gracefully: the last good frame is kept until a
+        new one arrives.
 
         Keys
         ----
         Enter / Space
-            Confirm the current selection and close the window.
+            Confirm the four selected corners and close the window.
+            Ignored until four valid corners are selected.
+        Backspace
+            Remove the most recently clicked corner.
         R / r
-            Reset the selection to ``initial_region`` (or clear it if none).
+            Reset to ``initial_region`` (or clear all corners if none).
         Esc
             Cancel and close the window.
 
@@ -447,7 +423,7 @@ class OverlayRenderer:
             Callable returning ``(success, frame)``.  ``frame`` must be a
             3-channel BGR image when ``success`` is ``True``.
         initial_region
-            Optional starting bed boundary in normalized coordinates.
+            Optional starting boundary with four normalized corners in order.
         window_name
             Optional calibration window name.  Defaults to
             ``"{monitor_window} - Bed Calibration"``.
@@ -458,10 +434,8 @@ class OverlayRenderer:
         Returns
         -------
         BedBoundary | None
-            Normalized rectangular boundary confirmed by the user, or ``None``
-            if cancelled or no valid frame was ever available to normalize
-            against.  The caller can retain the latest valid frame by calling
-            ``read_frame`` after calibration returns.
+            Normalized quadrilateral confirmed by the user, or ``None`` if
+            cancelled or no valid frame was ever available.
         """
         if not callable(read_frame):
             raise TypeError("read_frame must be callable")
@@ -469,16 +443,18 @@ class OverlayRenderer:
         win = window_name or f"{self.window_name} - Bed Calibration"
         self._calib_cancelled = False
         self._calib_confirmed = False
+        self._calib_points: list[tuple[float, float]] = []
         self._calib_current_frame: np.ndarray | None = None
+        self._calib_has_valid_frame = False
 
         fallback = np.zeros((480, 640, 3), dtype=np.uint8)
         have_valid_frame = False
         last_valid_shape: tuple[int, ...] | None = None
 
-        # Initialize selection using fallback dimensions so the overlay can be
-        # drawn before the first live frame arrives.  It is rescaled when the
-        # first valid frame is read.
-        self._reset_calib_selection(fallback.shape, initial_region)
+        # Initialize selection before the first live frame arrives.
+        self._calib_width = fallback.shape[1]
+        self._calib_height = fallback.shape[0]
+        self._reset_calib_selection(initial_region)
 
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(win, self._on_calib_mouse)
@@ -496,15 +472,15 @@ class OverlayRenderer:
                     last_valid_shape = self._calib_current_frame.shape
                     if not have_valid_frame:
                         have_valid_frame = True
-                        self._reset_calib_selection(
-                            self._calib_current_frame.shape, initial_region
-                        )
+                        self._calib_has_valid_frame = True
                 elif self._calib_current_frame is None:
                     self._calib_current_frame = fallback
 
                 display_frame = self._calib_current_frame
                 assert display_frame is not None
                 height, width = display_frame.shape[:2]
+                self._calib_width = width
+                self._calib_height = height
                 display = self._draw_calibration_overlay(
                     display_frame, width, height
                 )
@@ -514,15 +490,16 @@ class OverlayRenderer:
                 if key == 27:  # Esc
                     self._calib_cancelled = True
                 elif key in (13, 32):  # Enter / Space
-                    if self._calib_selection is not None and have_valid_frame:
+                    if (
+                        have_valid_frame
+                        and self._validate_calib_points(self._calib_points)[0]
+                    ):
                         self._calib_confirmed = True
                 elif key in (ord("r"), ord("R")):
-                    if have_valid_frame and self._calib_current_frame is not None:
-                        self._reset_calib_selection(
-                            self._calib_current_frame.shape, initial_region
-                        )
-                    else:
-                        self._reset_calib_selection(fallback.shape, initial_region)
+                    self._reset_calib_selection(initial_region)
+                elif key in (8, 127):  # Backspace
+                    if self._calib_points:
+                        self._calib_points.pop()
         finally:
             cv2.setMouseCallback(win, lambda *args, **kwargs: None)
             cv2.destroyWindow(win)
@@ -530,28 +507,14 @@ class OverlayRenderer:
 
         if (
             self._calib_cancelled
-            or self._calib_selection is None
             or not have_valid_frame
             or last_valid_shape is None
+            or not self._validate_calib_points(self._calib_points)[0]
         ):
             return None
 
-        height, width = last_valid_shape[:2]
-        selection = self._calib_selection
-        (x1, y1), (x2, y2) = selection
-        x1, x2 = sorted(
-            [max(0, min(width, x1)) / width, max(0, min(width, x2)) / width]
-        )
-        y1, y2 = sorted(
-            [max(0, min(height, y1)) / height, max(0, min(height, y2)) / height]
-        )
         return BedBoundary(
-            points=[
-                (x1, y1),
-                (x2, y1),
-                (x2, y2),
-                (x1, y2),
-            ],
+            points=[(float(p[0]), float(p[1])) for p in self._calib_points],
             label=self.labels.get("bed", "BED"),
         )
 
@@ -748,73 +711,6 @@ class OverlayRenderer:
             )
             y += line_height
 
-    def _apply_zoom(self, frame: np.ndarray) -> np.ndarray:
-        """Crop/resize ``frame`` around its center using the current zoom level.
-
-        Zoom levels greater than 1.0x crop a centered region and upscale it
-        back to the original dimensions.  Levels below 1.0x scale the frame
-        down and letterbox it with black borders.  1.0x returns the frame
-        unchanged.
-        """
-        if math.isclose(self._zoom_level, 1.0):
-            return frame
-
-        height, width = frame.shape[:2]
-
-        if self._zoom_level > 1.0:
-            crop_w = max(1, int(width / self._zoom_level))
-            crop_h = max(1, int(height / self._zoom_level))
-            x1 = (width - crop_w) // 2
-            y1 = (height - crop_h) // 2
-            cropped = frame[y1 : y1 + crop_h, x1 : x1 + crop_w]
-            return cv2.resize(
-                cropped, (width, height), interpolation=cv2.INTER_LINEAR
-            )
-
-        # Zoom out: scale down and center on a black background.
-        new_w = max(1, int(width * self._zoom_level))
-        new_h = max(1, int(height * self._zoom_level))
-        scaled = cv2.resize(
-            frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR
-        )
-        result = np.zeros_like(frame)
-        x1 = (width - new_w) // 2
-        y1 = (height - new_h) // 2
-        result[y1 : y1 + new_h, x1 : x1 + new_w] = scaled
-        return result
-
-    def _draw_zoom_hint(self, canvas: np.ndarray) -> None:
-        """Draw a compact zoom badge when the view is not at 1.0x."""
-        if math.isclose(self._zoom_level, 1.0):
-            return
-
-        height, width = canvas.shape[:2]
-        text = f"{self._zoom_level:.1f}x   +/- zoom   0 reset"
-        font = self.font_scale * 0.72
-        (tw, th), baseline = cv2.getTextSize(
-            text, cv2.FONT_HERSHEY_SIMPLEX, font, 1
-        )
-        margin = max(8, int(width * 0.012))
-        pad = 6
-        x2 = width - margin
-        y2 = height - margin
-        x1 = x2 - tw - pad * 2
-        y1 = y2 - th - baseline - pad * 2
-
-        self._fill_round_rect(
-            canvas, (x1, y1), (x2, y2), PALETTE["panel_bg"], 6
-        )
-        cv2.putText(
-            canvas,
-            text,
-            (x1 + pad, y2 - pad - baseline),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font,
-            PALETTE["text_muted"],
-            1,
-            cv2.LINE_AA,
-        )
-
     def _draw_bed_boundary(
         self,
         canvas: np.ndarray,
@@ -993,88 +889,203 @@ class OverlayRenderer:
         self, event: int, x: int, y: int, flags: int, param: Any
     ) -> None:
         """Mouse callback for the bed calibration window."""
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self._calib_start = (x, y)
-            self._calib_end = (x, y)
-            self._calib_drawing = True
-            self._calib_selection = (self._calib_start, self._calib_end)
-        elif event == cv2.EVENT_MOUSEMOVE and self._calib_drawing:
-            self._calib_end = (x, y)
-            self._calib_selection = (self._calib_start, self._calib_end)
-        elif event == cv2.EVENT_LBUTTONUP:
-            self._calib_drawing = False
-            self._calib_end = (x, y)
-            self._calib_selection = (self._calib_start, self._calib_end)
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if not self._calib_has_valid_frame:
+            return
+        if len(self._calib_points) >= 4:
+            return
+        width = max(1, self._calib_width)
+        height = max(1, self._calib_height)
+        nx = max(0.0, min(1.0, x / width))
+        ny = max(0.0, min(1.0, y / height))
+        if math.isfinite(nx) and math.isfinite(ny):
+            self._calib_points.append((nx, ny))
 
     def _reset_calib_selection(
         self,
-        frame_shape: tuple[int, ...],
         initial_region: BedBoundary | None,
     ) -> None:
         """Reset the calibration selection to ``initial_region`` or clear it."""
-        height, width = frame_shape[:2]
         if initial_region is not None:
-            xs = [p[0] for p in initial_region.points]
-            ys = [p[1] for p in initial_region.points]
-            x1 = int(min(xs) * width)
-            x2 = int(max(xs) * width)
-            y1 = int(min(ys) * height)
-            y2 = int(max(ys) * height)
-            self._calib_start = (x1, y1)
-            self._calib_end = (x2, y2)
-            self._calib_selection = ((x1, y1), (x2, y2))
-        else:
-            self._calib_start = None
-            self._calib_end = None
-            self._calib_selection = None
-        self._calib_drawing = False
+            points = [
+                (float(p[0]), float(p[1]))
+                for p in initial_region.points
+                if math.isfinite(p[0]) and math.isfinite(p[1])
+            ]
+            if len(points) == 4:
+                self._calib_points = points
+                return
+        self._calib_points = []
+
+    def _validate_calib_points(
+        self, points: Sequence[tuple[float, float]]
+    ) -> tuple[bool, str]:
+        """Return ``(ok, reason)`` for the current corner selection.
+
+        The quadrilateral must contain four distinct, finite, normalized points
+        that form a convex clockwise polygon without self-crossing edges.
+        """
+        if len(points) != 4:
+            return False, "select 4 corners"
+
+        if not all(
+            math.isfinite(p[0])
+            and math.isfinite(p[1])
+            and 0.0 <= p[0] <= 1.0
+            and 0.0 <= p[1] <= 1.0
+            for p in points
+        ):
+            return False, "points must be inside frame"
+
+        # Distinct corners.
+        tol = 1e-4
+        for i in range(4):
+            ax, ay = points[i]
+            for j in range(i + 1, 4):
+                bx, by = points[j]
+                if math.hypot(ax - bx, ay - by) < tol:
+                    return False, "duplicate points"
+
+        # Convex clockwise turns (same ordering used by calibration.py).
+        cross_tol = 1e-6
+        crosses: list[float] = []
+        for i in range(4):
+            ax, ay = points[i]
+            bx, by = points[(i + 1) % 4]
+            cx, cy = points[(i + 2) % 4]
+            crosses.append((bx - ax) * (cy - by) - (by - ay) * (cx - bx))
+        if not all(c > cross_tol for c in crosses):
+            return False, "not convex / wrong order"
+
+        # Explicit non-self-crossing guard for the two non-adjacent edge pairs.
+        def _seg_intersect(
+            a: tuple[float, float],
+            b: tuple[float, float],
+            c: tuple[float, float],
+            d: tuple[float, float],
+        ) -> bool:
+            def _orient(
+                ax: float, ay: float, bx: float, by: float, cx: float, cy: float
+            ) -> float:
+                return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+            o1 = _orient(*a, *b, *c)
+            o2 = _orient(*a, *b, *d)
+            o3 = _orient(*c, *d, *a)
+            o4 = _orient(*c, *d, *b)
+            return o1 * o2 < 0 and o3 * o4 < 0
+
+        if _seg_intersect(points[0], points[1], points[2], points[3]) or _seg_intersect(
+            points[1], points[2], points[3], points[0]
+        ):
+            return False, "edges cross"
+
+        return True, ""
 
     def _draw_calibration_overlay(
         self, frame: np.ndarray, width: int, height: int
     ) -> np.ndarray:
         """Return a copy of ``frame`` with the current selection and instructions."""
         display = frame.copy()
+        self._calib_width = width
+        self._calib_height = height
 
-        if self._calib_selection is not None:
-            (x1, y1), (x2, y2) = self._calib_selection
-            x1, x2 = sorted([max(0, min(width, x1)), max(0, min(width, x2))])
-            y1, y2 = sorted([max(0, min(height, y1)), max(0, min(height, y2))])
+        pts = [
+            (int(max(0, min(width - 1, p[0] * width))),
+             int(max(0, min(height - 1, p[1] * height))))
+            for p in self._calib_points
+        ]
+        n = len(pts)
+        valid, error = self._validate_calib_points(self._calib_points)
 
-            if x2 > x1 and y2 > y1:
-                overlay = display.copy()
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), PALETTE["bed_glow"], -1)
-                cv2.addWeighted(
-                    overlay, self.panel_alpha, display, 1 - self.panel_alpha, 0, display
-                )
-                cv2.rectangle(
-                    display, (x1, y1), (x2, y2), PALETTE["bed"], 2, cv2.LINE_AA
-                )
+        if n == 4 and valid:
+            color = PALETTE["bed"]
+        elif n == 4:
+            color = PALETTE["danger"]
+        else:
+            color = PALETTE["caution"]
 
-        self._draw_instruction_strip(display)
+        # Connecting polyline (closed only when complete and valid).
+        for i in range(n - 1):
+            cv2.line(display, pts[i], pts[i + 1], color, 2, cv2.LINE_AA)
+        if n == 4 and valid:
+            cv2.line(display, pts[-1], pts[0], color, 2, cv2.LINE_AA)
+            overlay = display.copy()
+            cv2.fillPoly(overlay, [np.array(pts, dtype=np.int32)], PALETTE["bed_glow"])
+            cv2.addWeighted(
+                overlay, self.panel_alpha, display, 1 - self.panel_alpha, 0, display
+            )
+
+        # Numbered corner markers.
+        for i, (px, py) in enumerate(pts):
+            cv2.circle(display, (px, py), 6, color, -1, cv2.LINE_AA)
+            cv2.circle(display, (px, py), 6, (255, 255, 255), 1, cv2.LINE_AA)
+            label = str(i + 1)
+            tx = min(width - 10, px + 10)
+            ty = max(20, py - 10)
+            cv2.putText(
+                display,
+                label,
+                (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                self.font_scale * 1.1,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+        self._draw_instruction_strip(display, n, valid, error)
         return display
 
-    def _draw_instruction_strip(self, display: np.ndarray) -> None:
+    def _draw_instruction_strip(
+        self,
+        display: np.ndarray,
+        n: int,
+        valid: bool,
+        error: str,
+    ) -> None:
         """Draw the calibration instruction strip at the bottom of the frame."""
         height, width = display.shape[:2]
         margin = max(10, int(width * 0.015))
         line_height = int(self.font_scale * 28)
-        panel_h = margin * 2 + len(_CALIB_INSTRUCTIONS) * line_height
 
+        if n < 4:
+            lines = [
+                "CLICK 4 CORNERS: 1=LT  2=RT  3=RB  4=LB",
+                f"{n}/4 selected   BACKSPACE undo   R reset   ESC cancel",
+            ]
+            color = PALETTE["text"]
+        elif valid:
+            lines = [
+                "QUAD OK. ENTER/SPACE confirm   R reset   ESC cancel",
+            ]
+            color = PALETTE["bed"]
+        else:
+            lines = [
+                f"INVALID: {error}",
+                "BACKSPACE undo   R reset   ESC cancel",
+            ]
+            color = PALETTE["danger"]
+
+        panel_h = margin * 2 + len(lines) * line_height
         overlay = display.copy()
-        cv2.rectangle(overlay, (0, height - panel_h), (width, height), PALETTE["panel_bg"], -1)
+        cv2.rectangle(
+            overlay, (0, height - panel_h), (width, height), PALETTE["panel_bg"], -1
+        )
         cv2.addWeighted(
             overlay, self.panel_alpha, display, 1 - self.panel_alpha, 0, display
         )
 
         y = height - panel_h + margin + int(self.font_scale * 20)
-        for line in _CALIB_INSTRUCTIONS:
+        for line in lines:
             cv2.putText(
                 display,
                 line,
                 (margin, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 self.font_scale,
-                PALETTE["text"],
+                color,
                 1,
                 cv2.LINE_AA,
             )
